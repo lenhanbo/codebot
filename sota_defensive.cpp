@@ -1236,8 +1236,8 @@ public:
         Actions a;
         update_state_and_clean_dead(S, M, P); 
         
-        plan_attacks(S, M, P, turn);
         detect_and_handle_emergencies(S, M, P); 
+        plan_attacks(S, M, P, turn);
         plan_expansion(S, M, P);
         
         process_build_plans(S, M, P, a);
