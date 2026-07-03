@@ -357,6 +357,102 @@ public:
         return E;
     }
 
+    // Tính số lượng địch còn sống sót sau một pha giao tranh (Field hoặc Base)
+    int get_surviving_enemies(int E, int enemy_troop_hp, int M, int my_troop_hp, int base_hp = 0, int base_ad = 0) const {
+        if (E <= 0) return 0;
+        int e_hp = E * enemy_troop_hp;
+        int m_hp = M * my_troop_hp;
+        int b_hp = base_hp;
+        
+        while (e_hp > 0 && (m_hp > 0 || b_hp > 0)) {
+            // Tháp pháo tấn công trước
+            e_hp -= base_ad;
+            if (e_hp <= 0) break;
+            
+            // Tính số lượng chiến binh thực tế còn sống để gây sát thương
+            int cur_e = (e_hp + enemy_troop_hp - 1) / enemy_troop_hp;
+            int cur_m = (m_hp > 0) ? ((m_hp + my_troop_hp - 1) / my_troop_hp) : 0;
+            
+            e_hp -= cur_m;
+            int dmg_to_us = cur_e;
+            
+            if (m_hp >= dmg_to_us) {
+                m_hp -= dmg_to_us;
+            } else {
+                int remaining = dmg_to_us - m_hp;
+                m_hp = 0;
+                b_hp -= remaining;
+            }
+        }
+        
+        if (e_hp <= 0) return 0;
+        return (e_hp + enemy_troop_hp - 1) / enemy_troop_hp;
+    }
+
+    // Mô phỏng Timeline để xem lính gặp nhau trên đường hay ở base
+    // Trả về true nếu base an toàn (tiêu diệt hết địch và base không nổ)
+    bool simulate_defense_timeline(
+        int enemy_start, int target, int initial_enemies, 
+        int e_hp_val, int m_hp_val, int base_hp, int base_ad,
+        const std::vector<Warrior>& defenders, const Paths& P) const 
+    {
+        int current_e = initial_enemies;
+        int e_pos = enemy_start;
+        int cur_base_hp = base_hp;
+        
+        std::map<WarriorId, int> m_pos;
+        std::map<WarriorId, bool> m_alive;
+        for (const auto& w : defenders) {
+            m_pos[w.id] = w.region;
+            m_alive[w.id] = true;
+        }
+
+        // Mô phỏng tối đa 50 ngày (tránh lặp vô hạn)
+        for (int turn = 0; turn < 50; ++turn) {
+            if (current_e <= 0) return true; 
+            
+            // Bước 1: Di chuyển
+            if (e_pos != target) {
+                e_pos = P.nxt[e_pos][target];
+            }
+            
+            std::map<int, int> defenders_in_region;
+            for (const auto& w : defenders) {
+                if (!m_alive[w.id]) continue;
+                if (m_pos[w.id] != target) {
+                    m_pos[w.id] = P.nxt[m_pos[w.id]][target];
+                }
+                defenders_in_region[m_pos[w.id]]++;
+            }
+            
+            // Bước 2: Giao tranh nếu đụng độ (trên đường đi hoặc ở base)
+            int m_count = defenders_in_region[e_pos];
+            if (m_count > 0 || e_pos == target) {
+                int b_hp = (e_pos == target) ? cur_base_hp : 0;
+                int b_ad = (e_pos == target) ? base_ad : 0;
+                
+                int next_e = get_surviving_enemies(current_e, e_hp_val, m_count, m_hp_val, b_hp, b_ad);
+                
+                // Cập nhật tử trận cho lính phòng thủ tại khu vực này
+                if (next_e > 0 && m_count > 0) {
+                    for (const auto& w : defenders) {
+                        if (m_alive[w.id] && m_pos[w.id] == e_pos) {
+                            m_alive[w.id] = false; // Quân ta bị quét sạch
+                        }
+                    }
+                }
+                
+                // Nếu địch đánh úp vào base và vẫn còn sống sót sau giao tranh -> vỡ trận
+                if (e_pos == target && next_e > 0) return false; 
+                
+                current_e = next_e;
+            }
+            
+            if (e_pos == target && current_e > 0) return false;
+        }
+        return current_e <= 0 || cur_base_hp > 0; 
+    }
+
     int get_locked_gold() const {
         int locked = 0;
         for (const auto& p : build_plans) locked += p.second.second;
@@ -592,35 +688,52 @@ public:
                         break;
                     }
                 }
-                int req_def = calculate_min_defenders(g.ids.size(), e_hp_val, b_hp, b_ad, m_hp_val);
 
-                int existing = 0;
+                // Tập hợp lính đã được điều đi phòng thủ mục tiêu này
+                std::vector<Warrior> current_assigned;
                 for (auto const& [my_id, e_ids] : predictive_defenders) {
                     if (emergency_targets.count(my_id) && emergency_targets.at(my_id) == best_target) {
-                        for(auto id: e_ids) if(g.ids.count(id)) { existing++; break; }
+                        for(auto id: e_ids) {
+                            if(g.ids.count(id)) { 
+                                for (const auto& w : my_warriors) if (w.id == my_id) current_assigned.push_back(w);
+                                break; 
+                            }
+                        }
                     }
                 }
 
-                int needed = req_def - existing;
-                if (needed > 0) {
+                // Chạy mô phỏng xem đạo quân hiện tại (có tính giao tranh dọc đường) đã an toàn chưa
+                bool is_safe = simulate_defense_timeline(g.current_region, best_target, g.ids.size(), e_hp_val, m_hp_val, b_hp, b_ad, current_assigned, P);
+
+                // Nếu không an toàn (quân ta ngã xuống dọc đường và địch đánh vỡ base) -> Gọi viện binh
+                if (!is_safe) {
                     std::vector<Warrior> free_cands = get_free_units(S);
                     std::sort(free_cands.begin(), free_cands.end(), [&](const Warrior& a, const Warrior& b){
                         return get_hops(P, a.region, best_target) < get_hops(P, b.region, best_target);
                     });
-
-                    int assigned = 0;
+                    
                     for (const auto& w : free_cands) {
-                        if (assigned >= needed) break;
                         int d_my = get_hops(P, w.region, best_target);
+                        // Chỉ lấy lính có đủ tốc độ đuổi theo hoặc đón đầu
                         if (d_my <= min_dist_enemy + 2) { 
+                            current_assigned.push_back(w);
                             predictive_defenders[w.id] = g.ids;
                             emergency_targets[w.id] = best_target;
-                            assigned++;
+                            
+                            // Mô phỏng lại ngay sau khi bơm thêm viện binh
+                            if (simulate_defense_timeline(g.current_region, best_target, g.ids.size(), e_hp_val, m_hp_val, b_hp, b_ad, current_assigned, P)) {
+                                is_safe = true;
+                                break; // Đã đủ quân chặn đánh
+                            }
                         }
                     }
-                    if (assigned < needed && best_target == M.my_hq) {
-                        emergency_train_queue += (needed - assigned);
-                    }
+                }
+
+                // Nếu vắt kiệt lính rảnh mà vẫn thất bại -> Kích hoạt Train khẩn cấp tại HQ
+                if (!is_safe && best_target == M.my_hq) {
+                    int basic_req = calculate_min_defenders(g.ids.size(), e_hp_val, b_hp, b_ad, m_hp_val);
+                    int shortage = std::max(1, basic_req - (int)current_assigned.size());
+                    emergency_train_queue += shortage;
                 }
             }
         }
@@ -661,7 +774,6 @@ public:
             }
         }
 
-        // --- Bắt đầu phần thay đổi logic tính toán baseline_invading_enemies ---
         int total_enemy = enemy_warriors.size();
 
         int enemy_labor = 0;
@@ -677,7 +789,6 @@ public:
 
         int attacking_bases_count = 0;
         for (const auto& g : active_enemy_attacks) {
-            // Nếu potential_targets không có HQ của mình, tức là chỉ đang nhắm vào base
             if (g.potential_targets.find(M.my_hq) == g.potential_targets.end()) {
                 attacking_bases_count += g.ids.size();
             }
@@ -693,7 +804,6 @@ public:
         int old_baseline = std::max(0, opp_hq_troop_count - opp_hq_labor_cap);
 
         int baseline_invading_enemies = std::max(estimated_all_in, old_baseline);
-        // --- Kết thúc phần thay đổi ---
 
         int e_hp = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
         int m_hp = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
