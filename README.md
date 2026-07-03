@@ -141,3 +141,4 @@ RESULT <LEFT_WIN/RIGHT_WIN/DRAW> <HQ_DESTROYED/TURN_LIMIT/WA>
 - `RESULT <LEFT_WIN/RIGHT_WIN/DRAW> <HQ_DESTROYED/TURN_LIMIT/WA>`: Game result. The reason for ending is one of: HQ destroyed (`HQ_DESTROYED`), day 200 reached (`TURN_LIMIT`), or wrong answer / timeout (`WA`).
 - `# Debug <LEFT/RIGHT>: <msg>`: A line printed by LEFT or RIGHT to standard error (stderr).
 "# codebot" 
+"# codebot" 
