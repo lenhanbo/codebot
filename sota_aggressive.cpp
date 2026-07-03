@@ -258,6 +258,11 @@ public:
     int custom_base_max_level = BASE_MAX_LEVEL;  
     bool done_building = false;     
 
+    // Trạng thái theo dõi địch
+    int opp_gold = START_GOLD;
+    std::set<WarriorId> prev_enemy_ids;
+    std::map<int, int> prev_enemy_bases;
+
     std::map<WarriorId, int> emergency_targets; 
     std::map<WarriorId, std::set<WarriorId>> predictive_defenders; 
     int current_req_defenders = 0;
@@ -299,6 +304,89 @@ public:
     const Building* opp_hq_b = nullptr;
     int enemy_bases_count = 0; 
 
+    // Hàm tracking kinh tế địch
+    void update_enemy_economy(const GameState& S, const GameMap& M) {
+        int income = 0;
+        std::set<WarriorId> curr_enemy_ids;
+        std::map<int, int> curr_enemy_bases;
+
+        for (const auto& b : S.buildings) {
+            if (b.side != M.my_side) {
+                curr_enemy_bases[b.region] = b.level;
+                int count = 0;
+                for (const auto& ew : S.warriors) {
+                    if (ew.id.side != M.my_side && ew.region == b.region) ++count;
+                }
+                income += WORK_INCOME * std::min(count, b.work_cap());
+            }
+        }
+        
+        int upkeep = 0;
+        int new_units = 0;
+        int move_cost_est = 0;
+
+        for (const auto& ew : S.warriors) {
+            if (ew.id.side != M.my_side) {
+                curr_enemy_ids.insert(ew.id);
+                upkeep += UPKEEP_PER_WARRIOR;
+                if (!prev_enemy_ids.count(ew.id)) new_units++;
+                
+                // Track move cost
+                if (last_enemy_pos.count(ew.id) && last_enemy_pos[ew.id] != ew.region) {
+                    bool target_is_base = false;
+                    for (const auto& b : S.buildings) {
+                        if (b.side != M.my_side && b.region == ew.region) { target_is_base = true; break; }
+                    }
+                    if (!target_is_base) move_cost_est += MOVE_COST;
+                }
+            }
+        }
+
+        int build_upgrade_cost = 0;
+        for (const auto& [reg, lvl] : curr_enemy_bases) {
+            if (!prev_enemy_bases.count(reg)) build_upgrade_cost += BASE_LEVELS[1].cost;
+            else if (lvl > prev_enemy_bases[reg]) {
+                if (reg == M.opp_hq) build_upgrade_cost += HQ_LEVELS[lvl].upgrade_cost;
+                else build_upgrade_cost += BASE_LEVELS[lvl].cost;
+            }
+        }
+
+        opp_gold += income;
+        opp_gold = std::max(0, opp_gold - upkeep);
+        opp_gold -= (new_units * TRAIN_COST);
+        opp_gold -= move_cost_est;
+        opp_gold -= build_upgrade_cost;
+        opp_gold = std::max(0, opp_gold); // Đảm bảo không âm do sai số xấp xỉ
+
+        prev_enemy_ids = curr_enemy_ids;
+        prev_enemy_bases = curr_enemy_bases;
+    }
+
+    int get_my_income(const GameState& S, const GameMap& M, int extra_labor = 0) const {
+        int income = 0;
+        for (const auto& b : S.buildings) {
+            if (b.side == M.my_side) {
+                int count = 0;
+                for (const auto& w : my_warriors) if (w.region == b.region) ++count;
+                income += WORK_INCOME * std::min(count, b.work_cap());
+            }
+        }
+        income += WORK_INCOME * extra_labor;
+        return income;
+    }
+
+    int get_enemy_income(const GameState& S, const GameMap& M) const {
+        int income = 0;
+        for (const auto& b : S.buildings) {
+            if (b.side != M.my_side) {
+                int count = 0;
+                for (const auto& ew : enemy_warriors) if (ew.region == b.region) ++count;
+                income += WORK_INCOME * std::min(count, b.work_cap());
+            }
+        }
+        return income;
+    }
+
     int get_total_labor(const GameState& S, const GameMap& M) const {
         int labor = 0;
         for (const auto& b : S.buildings) {
@@ -306,6 +394,7 @@ public:
         }
         return labor;
     }
+    
     int get_enemy_total_labor(const GameState& S, const GameMap& M) const {
         int labor = 0;
         for (const auto& b : S.buildings) {
@@ -355,6 +444,89 @@ public:
             if (b_hp > 0) return D;
         }
         return E;
+    }
+
+    // --- CƠ CHẾ EXHAUSTIVE SIMULATION (VÉT CẠN) ---
+    bool is_safe_against_all_in(const GameState &S, const GameMap &M, const Paths &P, int target_region, int build_cost, bool is_new_base) {
+        // Quét qua các kịch bản thời gian địch "nhịn" đẻ dồn lính
+        std::vector<int> t_values = {5,10,15,20};
+        
+        int current_e = enemy_warriors.size();
+        int opp_train_cap = opp_hq_b ? opp_hq_b->train_cap() : 1;
+        int opp_inc = get_enemy_income(S, M);
+
+        int added_labor = 0;
+        if (is_new_base) added_labor = BASE_LEVELS[1].work_cap;
+        else {
+            for (auto& b : S.buildings) if (b.region == target_region && b.side == M.my_side) {
+                if (b.type == BType::HQ) added_labor = HQ_LEVELS[b.level + 1].work_cap - HQ_LEVELS[b.level].work_cap;
+                else added_labor = BASE_LEVELS[b.level + 1].work_cap - BASE_LEVELS[b.level].work_cap;
+                break;
+            }
+        }
+
+        for (int t : t_values) {
+            // Giả lập kinh tế địch tại mốc t
+            int sim_opp_gold = opp_gold;
+            int sim_e = current_e;
+            for(int i = 0; i < t; ++i) {
+                sim_opp_gold += opp_inc - (sim_e * 2);
+                int spawn = std::min({std::max(0, sim_opp_gold) / TRAIN_COST, opp_train_cap});
+                sim_e += spawn;
+                sim_opp_gold -= spawn * TRAIN_COST;
+            }
+
+            // Lấy danh sách toàn bộ các Base để kiểm tra
+            std::vector<int> bases_to_check;
+            bases_to_check.push_back(M.my_hq);
+            for (auto& b : my_bases) bases_to_check.push_back(b.region);
+            if (std::find(bases_to_check.begin(), bases_to_check.end(), target_region) == bases_to_check.end()) {
+                bases_to_check.push_back(target_region);
+            }
+
+            // Duyệt kiểm tra từng Base
+            for (int base_reg : bases_to_check) {
+                int d = get_hops(P, M.opp_hq, base_reg);
+                int T_impact = t + d;
+
+                int b_hp = 10, b_ad = 0;
+                if (base_reg == target_region && is_new_base) {
+                    b_hp = BASE_LEVELS[1].hp; b_ad = BASE_LEVELS[1].turret;
+                } else if (base_reg == target_region && !is_new_base) {
+                    for (auto& b : S.buildings) if (b.region == base_reg) {
+                        b_hp = (b.type == BType::HQ) ? HQ_LEVELS[b.level + 1].hp : BASE_LEVELS[b.level + 1].hp;
+                        b_ad = (b.type == BType::HQ) ? HQ_LEVELS[b.level + 1].turret : BASE_LEVELS[b.level + 1].turret;
+                    }
+                } else {
+                    for (auto& b : S.buildings) if (b.region == base_reg) {
+                        b_hp = b.hp; b_ad = get_b_ad(S, base_reg); break;
+                    }
+                }
+
+                int e_hp_val = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
+                int m_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
+                int req_def = calculate_min_defenders(sim_e, e_hp_val, b_hp, b_ad, m_hp_val);
+
+                // Giả lập kinh tế ta sau khi đã tiêu build_cost
+                int my_sim_gold = virtual_gold - build_cost;
+                int my_train_cap = hq_b ? hq_b->train_cap() : 1;
+                int my_inc = get_my_income(S, M, added_labor);
+                int my_units = my_warriors.size();
+                int max_defenders = my_units;
+
+                for(int i = 0; i < T_impact; ++i) {
+                    my_sim_gold += my_inc - (my_units * 2);
+                    int spawn = std::min({std::max(0, my_sim_gold) / TRAIN_COST, my_train_cap});
+                    max_defenders += spawn;
+                    my_units += spawn;
+                    my_sim_gold -= spawn * TRAIN_COST;
+                }
+
+                // Nếu lực lượng tổng trù tính nhỏ hơn req_def, lệnh xây này bị hủy
+                if (max_defenders < req_def) return false;
+            }
+        }
+        return true; // Sống sót qua mọi kịch bản Worst-case!
     }
 
     int get_locked_gold() const {
@@ -421,6 +593,8 @@ public:
     }
 
     void update_state_and_clean_dead(const GameState &S, const GameMap &M, const Paths &P) {
+        update_enemy_economy(S, M); // Gọi hàm Tracking 
+
         my_warriors.clear(); enemy_warriors.clear(); my_bases.clear();
         hq_b = nullptr; opp_hq_b = nullptr;
         enemy_bases_count = 0; 
@@ -661,7 +835,6 @@ public:
             }
         }
 
-        // --- Bắt đầu phần thay đổi logic tính toán baseline_invading_enemies ---
         int total_enemy = enemy_warriors.size();
 
         int enemy_labor = 0;
@@ -677,7 +850,6 @@ public:
 
         int attacking_bases_count = 0;
         for (const auto& g : active_enemy_attacks) {
-            // Nếu potential_targets không có HQ của mình, tức là chỉ đang nhắm vào base
             if (g.potential_targets.find(M.my_hq) == g.potential_targets.end()) {
                 attacking_bases_count += g.ids.size();
             }
@@ -693,7 +865,6 @@ public:
         int old_baseline = std::max(0, opp_hq_troop_count - opp_hq_labor_cap);
 
         int baseline_invading_enemies = std::max(estimated_all_in, old_baseline);
-        // --- Kết thúc phần thay đổi ---
 
         int e_hp = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
         int m_hp = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
@@ -1027,6 +1198,13 @@ public:
 
         for (const auto& cand : cands) {
             int base_budget = get_spendable_gold();
+            
+            // --- SỬ DỤNG HÀM SIMULATION TẠI ĐÂY ---
+            if (!is_safe_against_all_in(S, M, P, cand.region, cand.cost, cand.is_new_base)) {
+                // Hủy ý định xây nếu việc trừ đi cand.cost khiến bất kỳ căn cứ nào sụp đổ
+                continue; 
+            }
+
             if (free_units.empty()) {
                 int D = cand.dist_to_my_hq;
                 int projected_gold = base_budget + (D * estimated_income);

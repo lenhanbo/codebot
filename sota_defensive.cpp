@@ -258,6 +258,11 @@ public:
     int custom_base_max_level = BASE_MAX_LEVEL;  
     bool done_building = false;     
 
+    // Trạng thái theo dõi địch
+    int opp_gold = START_GOLD;
+    std::set<WarriorId> prev_enemy_ids;
+    std::map<int, int> prev_enemy_bases;
+
     std::map<WarriorId, int> emergency_targets; 
     std::map<WarriorId, std::set<WarriorId>> predictive_defenders; 
     int current_req_defenders = 0;
@@ -299,6 +304,89 @@ public:
     const Building* opp_hq_b = nullptr;
     int enemy_bases_count = 0; 
 
+    // Hàm tracking kinh tế địch
+    void update_enemy_economy(const GameState& S, const GameMap& M) {
+        int income = 0;
+        std::set<WarriorId> curr_enemy_ids;
+        std::map<int, int> curr_enemy_bases;
+
+        for (const auto& b : S.buildings) {
+            if (b.side != M.my_side) {
+                curr_enemy_bases[b.region] = b.level;
+                int count = 0;
+                for (const auto& ew : S.warriors) {
+                    if (ew.id.side != M.my_side && ew.region == b.region) ++count;
+                }
+                income += WORK_INCOME * std::min(count, b.work_cap());
+            }
+        }
+        
+        int upkeep = 0;
+        int new_units = 0;
+        int move_cost_est = 0;
+
+        for (const auto& ew : S.warriors) {
+            if (ew.id.side != M.my_side) {
+                curr_enemy_ids.insert(ew.id);
+                upkeep += UPKEEP_PER_WARRIOR;
+                if (!prev_enemy_ids.count(ew.id)) new_units++;
+                
+                // Track move cost
+                if (last_enemy_pos.count(ew.id) && last_enemy_pos[ew.id] != ew.region) {
+                    bool target_is_base = false;
+                    for (const auto& b : S.buildings) {
+                        if (b.side != M.my_side && b.region == ew.region) { target_is_base = true; break; }
+                    }
+                    if (!target_is_base) move_cost_est += MOVE_COST;
+                }
+            }
+        }
+
+        int build_upgrade_cost = 0;
+        for (const auto& [reg, lvl] : curr_enemy_bases) {
+            if (!prev_enemy_bases.count(reg)) build_upgrade_cost += BASE_LEVELS[1].cost;
+            else if (lvl > prev_enemy_bases[reg]) {
+                if (reg == M.opp_hq) build_upgrade_cost += HQ_LEVELS[lvl].upgrade_cost;
+                else build_upgrade_cost += BASE_LEVELS[lvl].cost;
+            }
+        }
+
+        opp_gold += income;
+        opp_gold = std::max(0, opp_gold - upkeep);
+        opp_gold -= (new_units * TRAIN_COST);
+        opp_gold -= move_cost_est;
+        opp_gold -= build_upgrade_cost;
+        opp_gold = std::max(0, opp_gold); // Đảm bảo không âm do sai số xấp xỉ
+
+        prev_enemy_ids = curr_enemy_ids;
+        prev_enemy_bases = curr_enemy_bases;
+    }
+
+    int get_my_income(const GameState& S, const GameMap& M, int extra_labor = 0) const {
+        int income = 0;
+        for (const auto& b : S.buildings) {
+            if (b.side == M.my_side) {
+                int count = 0;
+                for (const auto& w : my_warriors) if (w.region == b.region) ++count;
+                income += WORK_INCOME * std::min(count, b.work_cap());
+            }
+        }
+        income += WORK_INCOME * extra_labor;
+        return income;
+    }
+
+    int get_enemy_income(const GameState& S, const GameMap& M) const {
+        int income = 0;
+        for (const auto& b : S.buildings) {
+            if (b.side != M.my_side) {
+                int count = 0;
+                for (const auto& ew : enemy_warriors) if (ew.region == b.region) ++count;
+                income += WORK_INCOME * std::min(count, b.work_cap());
+            }
+        }
+        return income;
+    }
+
     int get_total_labor(const GameState& S, const GameMap& M) const {
         int labor = 0;
         for (const auto& b : S.buildings) {
@@ -306,6 +394,7 @@ public:
         }
         return labor;
     }
+    
     int get_enemy_total_labor(const GameState& S, const GameMap& M) const {
         int labor = 0;
         for (const auto& b : S.buildings) {
@@ -357,100 +446,87 @@ public:
         return E;
     }
 
-    // Tính số lượng địch còn sống sót sau một pha giao tranh (Field hoặc Base)
-    int get_surviving_enemies(int E, int enemy_troop_hp, int M, int my_troop_hp, int base_hp = 0, int base_ad = 0) const {
-        if (E <= 0) return 0;
-        int e_hp = E * enemy_troop_hp;
-        int m_hp = M * my_troop_hp;
-        int b_hp = base_hp;
+    // --- CƠ CHẾ EXHAUSTIVE SIMULATION (VÉT CẠN) ---
+    bool is_safe_against_all_in(const GameState &S, const GameMap &M, const Paths &P, int target_region, int build_cost, bool is_new_base) {
+        // Quét qua các kịch bản thời gian địch "nhịn" đẻ dồn lính
+        std::vector<int> t_values = {5,10,15,20};
         
-        while (e_hp > 0 && (m_hp > 0 || b_hp > 0)) {
-            // Tháp pháo tấn công trước
-            e_hp -= base_ad;
-            if (e_hp <= 0) break;
-            
-            // Tính số lượng chiến binh thực tế còn sống để gây sát thương
-            int cur_e = (e_hp + enemy_troop_hp - 1) / enemy_troop_hp;
-            int cur_m = (m_hp > 0) ? ((m_hp + my_troop_hp - 1) / my_troop_hp) : 0;
-            
-            e_hp -= cur_m;
-            int dmg_to_us = cur_e;
-            
-            if (m_hp >= dmg_to_us) {
-                m_hp -= dmg_to_us;
-            } else {
-                int remaining = dmg_to_us - m_hp;
-                m_hp = 0;
-                b_hp -= remaining;
+        int current_e = enemy_warriors.size();
+        int opp_train_cap = opp_hq_b ? opp_hq_b->train_cap() : 1;
+        int opp_inc = get_enemy_income(S, M);
+
+        int added_labor = 0;
+        if (is_new_base) added_labor = BASE_LEVELS[1].work_cap;
+        else {
+            for (auto& b : S.buildings) if (b.region == target_region && b.side == M.my_side) {
+                if (b.type == BType::HQ) added_labor = HQ_LEVELS[b.level + 1].work_cap - HQ_LEVELS[b.level].work_cap;
+                else added_labor = BASE_LEVELS[b.level + 1].work_cap - BASE_LEVELS[b.level].work_cap;
+                break;
             }
         }
-        
-        if (e_hp <= 0) return 0;
-        return (e_hp + enemy_troop_hp - 1) / enemy_troop_hp;
-    }
 
-    // Mô phỏng Timeline để xem lính gặp nhau trên đường hay ở base
-    // Trả về true nếu base an toàn (tiêu diệt hết địch và base không nổ)
-    bool simulate_defense_timeline(
-        int enemy_start, int target, int initial_enemies, 
-        int e_hp_val, int m_hp_val, int base_hp, int base_ad,
-        const std::vector<Warrior>& defenders, const Paths& P) const 
-    {
-        int current_e = initial_enemies;
-        int e_pos = enemy_start;
-        int cur_base_hp = base_hp;
-        
-        std::map<WarriorId, int> m_pos;
-        std::map<WarriorId, bool> m_alive;
-        for (const auto& w : defenders) {
-            m_pos[w.id] = w.region;
-            m_alive[w.id] = true;
-        }
+        for (int t : t_values) {
+            // Giả lập kinh tế địch tại mốc t
+            int sim_opp_gold = opp_gold;
+            int sim_e = current_e;
+            for(int i = 0; i < t; ++i) {
+                sim_opp_gold += opp_inc - (sim_e * 2);
+                int spawn = std::min({std::max(0, sim_opp_gold) / TRAIN_COST, opp_train_cap});
+                sim_e += spawn;
+                sim_opp_gold -= spawn * TRAIN_COST;
+            }
 
-        // Mô phỏng tối đa 50 ngày (tránh lặp vô hạn)
-        for (int turn = 0; turn < 50; ++turn) {
-            if (current_e <= 0) return true; 
-            
-            // Bước 1: Di chuyển
-            if (e_pos != target) {
-                e_pos = P.nxt[e_pos][target];
+            // Lấy danh sách toàn bộ các Base để kiểm tra
+            std::vector<int> bases_to_check;
+            bases_to_check.push_back(M.my_hq);
+            for (auto& b : my_bases) bases_to_check.push_back(b.region);
+            if (std::find(bases_to_check.begin(), bases_to_check.end(), target_region) == bases_to_check.end()) {
+                bases_to_check.push_back(target_region);
             }
-            
-            std::map<int, int> defenders_in_region;
-            for (const auto& w : defenders) {
-                if (!m_alive[w.id]) continue;
-                if (m_pos[w.id] != target) {
-                    m_pos[w.id] = P.nxt[m_pos[w.id]][target];
-                }
-                defenders_in_region[m_pos[w.id]]++;
-            }
-            
-            // Bước 2: Giao tranh nếu đụng độ (trên đường đi hoặc ở base)
-            int m_count = defenders_in_region[e_pos];
-            if (m_count > 0 || e_pos == target) {
-                int b_hp = (e_pos == target) ? cur_base_hp : 0;
-                int b_ad = (e_pos == target) ? base_ad : 0;
-                
-                int next_e = get_surviving_enemies(current_e, e_hp_val, m_count, m_hp_val, b_hp, b_ad);
-                
-                // Cập nhật tử trận cho lính phòng thủ tại khu vực này
-                if (next_e > 0 && m_count > 0) {
-                    for (const auto& w : defenders) {
-                        if (m_alive[w.id] && m_pos[w.id] == e_pos) {
-                            m_alive[w.id] = false; // Quân ta bị quét sạch
-                        }
+
+            // Duyệt kiểm tra từng Base
+            for (int base_reg : bases_to_check) {
+                int d = get_hops(P, M.opp_hq, base_reg);
+                int T_impact = t + d;
+
+                int b_hp = 10, b_ad = 0;
+                if (base_reg == target_region && is_new_base) {
+                    b_hp = BASE_LEVELS[1].hp; b_ad = BASE_LEVELS[1].turret;
+                } else if (base_reg == target_region && !is_new_base) {
+                    for (auto& b : S.buildings) if (b.region == base_reg) {
+                        b_hp = (b.type == BType::HQ) ? HQ_LEVELS[b.level + 1].hp : BASE_LEVELS[b.level + 1].hp;
+                        b_ad = (b.type == BType::HQ) ? HQ_LEVELS[b.level + 1].turret : BASE_LEVELS[b.level + 1].turret;
+                    }
+                } else {
+                    for (auto& b : S.buildings) if (b.region == base_reg) {
+                        b_hp = b.hp; b_ad = get_b_ad(S, base_reg); break;
                     }
                 }
-                
-                // Nếu địch đánh úp vào base và vẫn còn sống sót sau giao tranh -> vỡ trận
-                if (e_pos == target && next_e > 0) return false; 
-                
-                current_e = next_e;
+
+                int e_hp_val = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
+                int m_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
+                int req_def = calculate_min_defenders(sim_e, e_hp_val, b_hp, b_ad, m_hp_val);
+
+                // Giả lập kinh tế ta sau khi đã tiêu build_cost
+                int my_sim_gold = virtual_gold - build_cost;
+                int my_train_cap = hq_b ? hq_b->train_cap() : 1;
+                int my_inc = get_my_income(S, M, added_labor);
+                int my_units = my_warriors.size();
+                int max_defenders = my_units;
+
+                for(int i = 0; i < T_impact; ++i) {
+                    my_sim_gold += my_inc - (my_units * 2);
+                    int spawn = std::min({std::max(0, my_sim_gold) / TRAIN_COST, my_train_cap});
+                    max_defenders += spawn;
+                    my_units += spawn;
+                    my_sim_gold -= spawn * TRAIN_COST;
+                }
+
+                // Nếu lực lượng tổng trù tính nhỏ hơn req_def, lệnh xây này bị hủy
+                if (max_defenders < req_def) return false;
             }
-            
-            if (e_pos == target && current_e > 0) return false;
         }
-        return current_e <= 0 || cur_base_hp > 0; 
+        return true; // Sống sót qua mọi kịch bản Worst-case!
     }
 
     int get_locked_gold() const {
@@ -517,6 +593,8 @@ public:
     }
 
     void update_state_and_clean_dead(const GameState &S, const GameMap &M, const Paths &P) {
+        update_enemy_economy(S, M); // Gọi hàm Tracking 
+
         my_warriors.clear(); enemy_warriors.clear(); my_bases.clear();
         hq_b = nullptr; opp_hq_b = nullptr;
         enemy_bases_count = 0; 
@@ -688,52 +766,35 @@ public:
                         break;
                     }
                 }
+                int req_def = calculate_min_defenders(g.ids.size(), e_hp_val, b_hp, b_ad, m_hp_val);
 
-                // Tập hợp lính đã được điều đi phòng thủ mục tiêu này
-                std::vector<Warrior> current_assigned;
+                int existing = 0;
                 for (auto const& [my_id, e_ids] : predictive_defenders) {
                     if (emergency_targets.count(my_id) && emergency_targets.at(my_id) == best_target) {
-                        for(auto id: e_ids) {
-                            if(g.ids.count(id)) { 
-                                for (const auto& w : my_warriors) if (w.id == my_id) current_assigned.push_back(w);
-                                break; 
-                            }
-                        }
+                        for(auto id: e_ids) if(g.ids.count(id)) { existing++; break; }
                     }
                 }
 
-                // Chạy mô phỏng xem đạo quân hiện tại (có tính giao tranh dọc đường) đã an toàn chưa
-                bool is_safe = simulate_defense_timeline(g.current_region, best_target, g.ids.size(), e_hp_val, m_hp_val, b_hp, b_ad, current_assigned, P);
-
-                // Nếu không an toàn (quân ta ngã xuống dọc đường và địch đánh vỡ base) -> Gọi viện binh
-                if (!is_safe) {
+                int needed = req_def - existing;
+                if (needed > 0) {
                     std::vector<Warrior> free_cands = get_free_units(S);
                     std::sort(free_cands.begin(), free_cands.end(), [&](const Warrior& a, const Warrior& b){
                         return get_hops(P, a.region, best_target) < get_hops(P, b.region, best_target);
                     });
-                    
+
+                    int assigned = 0;
                     for (const auto& w : free_cands) {
+                        if (assigned >= needed) break;
                         int d_my = get_hops(P, w.region, best_target);
-                        // Chỉ lấy lính có đủ tốc độ đuổi theo hoặc đón đầu
                         if (d_my <= min_dist_enemy + 2) { 
-                            current_assigned.push_back(w);
                             predictive_defenders[w.id] = g.ids;
                             emergency_targets[w.id] = best_target;
-                            
-                            // Mô phỏng lại ngay sau khi bơm thêm viện binh
-                            if (simulate_defense_timeline(g.current_region, best_target, g.ids.size(), e_hp_val, m_hp_val, b_hp, b_ad, current_assigned, P)) {
-                                is_safe = true;
-                                break; // Đã đủ quân chặn đánh
-                            }
+                            assigned++;
                         }
                     }
-                }
-
-                // Nếu vắt kiệt lính rảnh mà vẫn thất bại -> Kích hoạt Train khẩn cấp tại HQ
-                if (!is_safe && best_target == M.my_hq) {
-                    int basic_req = calculate_min_defenders(g.ids.size(), e_hp_val, b_hp, b_ad, m_hp_val);
-                    int shortage = std::max(1, basic_req - (int)current_assigned.size());
-                    emergency_train_queue += shortage;
+                    if (assigned < needed && best_target == M.my_hq) {
+                        emergency_train_queue += (needed - assigned);
+                    }
                 }
             }
         }
@@ -1137,6 +1198,13 @@ public:
 
         for (const auto& cand : cands) {
             int base_budget = get_spendable_gold();
+            
+            // --- SỬ DỤNG HÀM SIMULATION TẠI ĐÂY ---
+            if (!is_safe_against_all_in(S, M, P, cand.region, cand.cost, cand.is_new_base)) {
+                // Hủy ý định xây nếu việc trừ đi cand.cost khiến bất kỳ căn cứ nào sụp đổ
+                continue; 
+            }
+
             if (free_units.empty()) {
                 int D = cand.dist_to_my_hq;
                 int projected_gold = base_budget + (D * estimated_income);
@@ -1345,9 +1413,9 @@ public:
     Actions decide(const GameState &S, const GameMap &M, const Paths &P, int turn) {
         Actions a;
         update_state_and_clean_dead(S, M, P); 
+        plan_attacks(S, M, P, turn);
         
         detect_and_handle_emergencies(S, M, P); 
-        plan_attacks(S, M, P, turn);
         plan_expansion(S, M, P);
         
         process_build_plans(S, M, P, a);
