@@ -711,7 +711,7 @@ public:
         }
 
         for (const auto& [path, ids] : moves) {
-            if (ids.size() >= 4) {
+            if (ids.size() >= 2) {
                 bool in_group = false;
                 for (const auto& g : active_enemy_attacks) {
                     if (g.ids.count(*ids.begin())) { in_group = true; break; }
