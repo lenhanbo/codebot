@@ -1646,7 +1646,7 @@ public:
             if (predictive_defenders.count(w.id) || emergency_targets.count(w.id)) {
                 final_target = emergency_targets[w.id];
                 is_emergency = true;
-            } else {
+            } else { //
                 bool in_mission = false;
                 for (const auto& m : active_missions) {
                     if (m.squad_ids.count(w.id)) {
