@@ -266,7 +266,8 @@ public:
     std::map<WarriorId, std::set<WarriorId>> predictive_defenders; 
     int current_req_defenders = 0;
     int enemy_min_dist_to_hq = 999;
-    
+    // THÊM DÒNG NÀY ĐỂ THEO DÕI THỜI GIAN ĐỊCH GOM QUÂN
+    std::map<int, int> enemy_concentration_turns;
     struct AttackMission {
         int target = -1;
         int rally_point = -1;
@@ -774,7 +775,7 @@ public:
         }
 
         for (const auto& [path, ids] : moves) {
-            if (ids.size() >= 4) {
+            if (ids.size() >= 2) {
                 bool in_group = false;
                 for (const auto& g : active_enemy_attacks) {
                     if (g.ids.count(*ids.begin())) { in_group = true; break; }
@@ -797,6 +798,76 @@ public:
                     if (!g.potential_targets.empty()) {
                         active_enemy_attacks.push_back(g);
                     }
+                }
+            }
+        }
+
+        // === BỔ SUNG LOGIC: GOM NHÓM KHI ĐỊCH TẬP TRUNG > LABOR CAP > 1 LƯỢT ===
+        std::map<int, int> enemy_count_per_region;
+        std::map<int, std::set<WarriorId>> enemy_ids_per_region;
+        for (const auto& ew : enemy_warriors) {
+            enemy_count_per_region[ew.region]++;
+            enemy_ids_per_region[ew.region].insert(ew.id);
+        }
+
+        std::map<int, int> excess_per_region;
+        for (auto const& [reg, count] : enemy_count_per_region) {
+                if (reg == M.opp_hq) continue;
+            int labor_cap = 0;
+            for (const auto& b : S.buildings) {
+                if (b.region == reg && b.side != M.my_side) {
+                    labor_cap = b.work_cap(); break;
+                }
+            }
+            // Tính số lính dư. Lấy max(1, labor_cap) để tránh bị báo động giả 
+            // bởi 1 tên lính đi ngang qua bãi đất trống.
+            int excess = count - std::max(1, labor_cap);
+            if (excess > 0) excess_per_region[reg] = excess;
+        }
+
+        // Cập nhật số lượt tập trung
+        for (auto it = enemy_concentration_turns.begin(); it != enemy_concentration_turns.end(); ) {
+            if (excess_per_region.find(it->first) == excess_per_region.end()) {
+                it = enemy_concentration_turns.erase(it); // Địch đã tản ra
+            } else {
+                ++it;
+            }
+        }
+
+        for (auto const& [reg, excess] : excess_per_region) {
+            enemy_concentration_turns[reg]++;
+            
+            // NẾU TẬP TRUNG LỚN HƠN 1 LƯỢT -> TẠO NHÓM TẤN CÔNG
+            if (enemy_concentration_turns[reg] > 1) {
+                std::set<WarriorId> gathered_ids;
+                for (auto id : enemy_ids_per_region[reg]) {
+                    // Chỉ lấy những lính chưa thuộc về bất kỳ nhóm tấn công nào khác
+                    bool in_group = false;
+                    for (const auto& g : active_enemy_attacks) {
+                        if (g.ids.count(id)) { in_group = true; break; }
+                    }
+                    if (!in_group) gathered_ids.insert(id);
+                }
+
+                if (!gathered_ids.empty()) {
+                    EnemyAttackGroup g;
+                    g.ids = gathered_ids;
+                    g.current_region = reg;
+                    g.idle_turns = enemy_concentration_turns[reg]; // Set > 0 để không bị xóa lập tức
+                    
+                    // Tìm Base gần điểm tập kết này nhất của mình để phòng thủ
+                    int best_target = M.my_hq;
+                    int min_dist = get_hops(P, reg, M.my_hq);
+                    for (const auto& b : my_bases) {
+                        int d = get_hops(P, reg, b.region);
+                        if (d < min_dist) {
+                            min_dist = d;
+                            best_target = b.region;
+                        }
+                    }
+                    g.potential_targets.insert(best_target);
+                    
+                    active_enemy_attacks.push_back(g);
                 }
             }
         }
@@ -911,14 +982,14 @@ public:
             }
         }
 
-        int attacking_bases_count = 0;
+        // === ĐÃ SỬA: CHỈ ĐẾM SỐ LƯỢNG LÍNH TRACKED THÀNH GROUP CHÍNH THỨC ===
+        int tracked_in_groups = 0;
         for (const auto& g : active_enemy_attacks) {
-            if (g.potential_targets.find(M.my_hq) == g.potential_targets.end()) {
-                attacking_bases_count += g.ids.size();
-            }
+            tracked_in_groups += g.ids.size();
         }
 
-        int estimated_all_in = std::max(0, total_enemy - enemy_labor - attacking_bases_count);
+        // Lượng nghi ngờ All-in là những tên lính vô hình chạy tản mạn
+        int estimated_all_in = std::max(0, total_enemy - enemy_labor - tracked_in_groups);
 
         int opp_hq_labor_cap = opp_hq_b ? opp_hq_b->work_cap() : 1;
         int opp_hq_troop_count = 0;
@@ -1650,8 +1721,17 @@ public:
         process_forward_build_plans(S, M, P, a);
 
         // 2. Chạy phòng thủ và tấn công
-        detect_and_handle_emergencies(S, M, P); 
-        plan_attacks(S, M, P, turn);
+        int myinc = get_my_income(S,M);
+        int enemyinc = get_enemy_income(S,M);
+
+        if(myinc > enemyinc){
+                detect_and_handle_emergencies(S, M, P); 
+                plan_attacks(S, M, P, turn);
+        } else {
+                
+                plan_attacks(S, M, P, turn);
+                detect_and_handle_emergencies(S, M, P); 
+        }
         
         // 3. Expansion thông thường và xử lý công việc
         plan_expansion(S, M, P);
