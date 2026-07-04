@@ -305,7 +305,10 @@ public:
     int enemy_bases_count = 0; 
 
     // Hàm tracking kinh tế địch
+    // Hàm tracking kinh tế địch (Đã fix lỗi Turn 1)
     void update_enemy_economy(const GameState& S, const GameMap& M) {
+        bool is_first_turn = prev_enemy_ids.empty() && prev_enemy_bases.empty();
+        
         int income = 0;
         std::set<WarriorId> curr_enemy_ids;
         std::map<int, int> curr_enemy_bases;
@@ -329,10 +332,9 @@ public:
             if (ew.id.side != M.my_side) {
                 curr_enemy_ids.insert(ew.id);
                 upkeep += UPKEEP_PER_WARRIOR;
-                if (!prev_enemy_ids.count(ew.id)) new_units++;
+                if (!is_first_turn && !prev_enemy_ids.count(ew.id)) new_units++;
                 
-                // Track move cost
-                if (last_enemy_pos.count(ew.id) && last_enemy_pos[ew.id] != ew.region) {
+                if (!is_first_turn && last_enemy_pos.count(ew.id) && last_enemy_pos[ew.id] != ew.region) {
                     bool target_is_base = false;
                     for (const auto& b : S.buildings) {
                         if (b.side != M.my_side && b.region == ew.region) { target_is_base = true; break; }
@@ -343,35 +345,41 @@ public:
         }
 
         int build_upgrade_cost = 0;
-        for (const auto& [reg, lvl] : curr_enemy_bases) {
-            if (!prev_enemy_bases.count(reg)) build_upgrade_cost += BASE_LEVELS[1].cost;
-            else if (lvl > prev_enemy_bases[reg]) {
-                if (reg == M.opp_hq) build_upgrade_cost += HQ_LEVELS[lvl].upgrade_cost;
-                else build_upgrade_cost += BASE_LEVELS[lvl].cost;
+        if (!is_first_turn) {
+            for (const auto& [reg, lvl] : curr_enemy_bases) {
+                if (!prev_enemy_bases.count(reg)) build_upgrade_cost += BASE_LEVELS[1].cost;
+                else if (lvl > prev_enemy_bases[reg]) {
+                    if (reg == M.opp_hq) build_upgrade_cost += HQ_LEVELS[lvl].upgrade_cost;
+                    else build_upgrade_cost += BASE_LEVELS[lvl].cost;
+                }
             }
         }
 
-        opp_gold += income;
-        opp_gold = std::max(0, opp_gold - upkeep);
-        opp_gold -= (new_units * TRAIN_COST);
-        opp_gold -= move_cost_est;
-        opp_gold -= build_upgrade_cost;
-        opp_gold = std::max(0, opp_gold); // Đảm bảo không âm do sai số xấp xỉ
+        if (is_first_turn) {
+            opp_gold = START_GOLD; // Đảm bảo khởi tạo đúng 500 vàng ở lượt đầu
+        } else {
+            opp_gold += income;
+            opp_gold = std::max(0, opp_gold - upkeep);
+            opp_gold -= (new_units * TRAIN_COST);
+            opp_gold -= move_cost_est;
+            opp_gold -= build_upgrade_cost;
+            opp_gold = std::max(0, opp_gold); 
+        }
 
         prev_enemy_ids = curr_enemy_ids;
         prev_enemy_bases = curr_enemy_bases;
     }
 
-    int get_my_income(const GameState& S, const GameMap& M, int extra_labor = 0) const {
+    int get_my_income(const GameState& S, const GameMap& M) const {
         int income = 0;
         for (const auto& b : S.buildings) {
             if (b.side == M.my_side) {
                 int count = 0;
                 for (const auto& w : my_warriors) if (w.region == b.region) ++count;
+                // Tính đúng số lính đang đứng hiện tại, không cộng ảo
                 income += WORK_INCOME * std::min(count, b.work_cap());
             }
         }
-        income += WORK_INCOME * extra_labor;
         return income;
     }
 
