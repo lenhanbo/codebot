@@ -248,7 +248,7 @@ public:
     const double TUNE_WEAK_BASE_BONUS = 150.0;    
     const double TUNE_HQ_TARGET_BONUS = 0.0;      
     const double TUNE_MAX_ARMY_RATIO = 0.7;       
-    const int TUNE_LABOR_ADVANTAGE_THRESHOLD = 5;
+    const int TUNE_LABOR_ADVANTAGE_THRESHOLD = 3;
     const int TUNE_MIN_LABOR_TO_FIGHT = 3; 
     const int TUNE_MAX_CONCURRENT_BUILDS = 2;
     const int TUNE_MAX_CONCURRENT_ATTACKS = 2; 
@@ -257,6 +257,9 @@ public:
     int custom_hq_max_level = HQ_MAX_LEVEL;    
     int custom_base_max_level = BASE_MAX_LEVEL;  
     bool done_building = false;     
+
+    bool is_rushing_hq = false;
+    bool has_labor_advantage = false;
 
     int opp_gold = START_GOLD;
     std::set<WarriorId> prev_enemy_ids;
@@ -1137,7 +1140,7 @@ public:
 
         int current_free_count = get_free_units(S).size();
 
-        // 1. Cập nhật và lọc các nhiệm vụ cũ (Dynamic Rallying & Giải phóng quân thừa)
+        // 1. Cập nhật và lọc các nhiệm vụ cũ
         for (auto it = active_missions.begin(); it != active_missions.end(); ) {
             bool target_alive = (it->target == M.opp_hq);
             if (!target_alive) {
@@ -1155,7 +1158,6 @@ public:
                 it = active_missions.erase(it); continue;
             }
             
-            // Re-calculate based on event-simulation
             int rp_dist_to_tgt = get_hops(P, it->rally_point, it->target);
             it->required_attackers = calculate_req_attackers(it->target, rp_dist_to_tgt, S, M, P);
             
@@ -1176,7 +1178,6 @@ public:
             int ready_at_rally = ready_wids.size();
             int current_squad_size = it->squad_ids.size();
 
-            // Nếu số quân gom được NHIỀU HƠN số yêu cầu hiện tại -> Giải phóng bớt lính (những người ở xa nhất)
             if (current_squad_size > it->required_attackers) {
                 std::vector<Warrior> squad_units;
                 for(auto wid : it->squad_ids) {
@@ -1214,7 +1215,7 @@ public:
                 }
                 it->target_arrival_turn = turn + max_d; 
             } else {
-                if (current_squad_size < it->required_attackers) {
+                if (current_squad_size < it->required_attackers && !is_rushing_hq) {
                     std::vector<Warrior> atk_units = get_attack_free_units();
                     std::sort(atk_units.begin(), atk_units.end(), [&](const Warrior& a, const Warrior& b) {
                         return get_hops(P, a.region, it->rally_point) < get_hops(P, b.region, it->rally_point);
@@ -1240,7 +1241,7 @@ public:
         int idle_army_count = temp_check_units.size(); 
 
         bool can_attack = (get_total_labor(S, M) >= TUNE_MIN_LABOR_TO_FIGHT);
-        if (can_attack && (done_building || spendable_gold >= 200 || idle_army_count >= 3)) {
+        if (can_attack && (done_building || spendable_gold >= 300 || idle_army_count >= 3)) {
             
             std::set<int> targeted;
             for (const auto& m : active_missions) targeted.insert(m.target);
@@ -1273,7 +1274,7 @@ public:
                     
                     int req = calculate_req_attackers(tgt, dist, S, M, P);
                     
-                    if (group.size() >= req && req <= 150) {
+                    if (group.size() >= req && req <= 50) {
                         AttackMission m;
                         m.target = tgt;
                         m.rally_point = reg;
@@ -1331,10 +1332,12 @@ public:
             for (const auto& opt : options) {
                 if (active_missions.size() >= TUNE_MAX_CONCURRENT_ATTACKS) break;
                 
-                int max_allowed_req = std::max(20, (int)(max_potential_army * TUNE_MAX_ARMY_RATIO));
+                int max_allowed_req = std::max(50, (int)(max_potential_army * TUNE_MAX_ARMY_RATIO));
                 if (opt.req > max_allowed_req) continue; 
                 
                 int available = atk_units.size();
+                // Chặn đẻ lính khi đang dồn tiền cho chiến thuật HQ Rushing
+                if (is_rushing_hq && available < opt.req) continue;
                 if (available == 0 && spendable_gold < TRAIN_COST) break; 
                 
                 int train_shortage = std::max(0, opt.req - available);
@@ -1388,8 +1391,7 @@ public:
     }
 
     void plan_forward_expansion(const GameState &S, const GameMap &M, const Paths &P) {
-        // Nếu đã đạt lợi thế lao động -> Không xây thêm base tiền phương
-        if (get_total_labor(S, M) >= get_enemy_total_labor(S, M) + TUNE_LABOR_ADVANTAGE_THRESHOLD) return; 
+        if (is_rushing_hq) return; 
 
         int current_builds = build_plans.size() + forward_build_plans.size();
         if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) return; 
@@ -1456,7 +1458,10 @@ public:
             int actual_cost = BASE_LEVELS[1].cost;
 
             if (w_copy.region == target_region && w_copy.state == WState::STATIONARY) {
-                if (virtual_gold >= actual_cost + total_upkeep) {
+                // KIỂM TRA: Khu vực này chưa có lệnh nâng cấp nào trong lượt này
+                bool already_upgrading = std::find(a.upgrades.begin(), a.upgrades.end(), target_region) != a.upgrades.end();
+                
+                if (!already_upgrading && virtual_gold >= actual_cost + total_upkeep) {
                     a.upgrades.push_back(target_region);
                     virtual_gold -= actual_cost;
                     virtual_job_slots[target_region] += BASE_LEVELS[1].work_cap;
@@ -1479,10 +1484,7 @@ public:
         return true;
     }
 
-    void plan_expansion(const GameState &S, const GameMap &M, const Paths &P) {
-        // Kiểm tra xem đã đạt lợi thế lao động chưa
-        bool labor_advantage = get_total_labor(S, M) >= get_enemy_total_labor(S, M) + TUNE_LABOR_ADVANTAGE_THRESHOLD;
-
+    void plan_expansion(const GameState &S, const GameMap &M, const Paths &P, bool hq_fast_tracked) {
         int current_builds = build_plans.size() + forward_build_plans.size();
         if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) return; 
         
@@ -1493,7 +1495,6 @@ public:
             int region; int cost; bool is_hq; bool is_new_base; 
             int dist_to_my_hq; int priority; 
             bool operator<(const PlanCandidate& o) const {
-                // Giữ NGUYÊN BẢN quy tắc sắp xếp của bạn: is_new_base > cost > priority
                 if (is_new_base != o.is_new_base) return is_new_base > o.is_new_base;
                 if (cost != o.cost) return cost < o.cost;
                 if (priority != o.priority) return priority < o.priority;
@@ -1541,8 +1542,7 @@ public:
             if (is_new) future_base_count++;
         }
 
-        // 1. Chỉ đưa Base mới vào danh sách ứng viên nếu CHƯA ĐẠT lợi thế
-        if (!labor_advantage) {
+        if (!is_rushing_hq) {
             for (int sh : M.strongholds) {
                 bool has_b = false; for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
                 bool already_planned = false; 
@@ -1564,8 +1564,7 @@ public:
             }
         }
 
-        // 2. LUÔN xét nâng cấp HQ nếu chưa đạt max level
-        if (hq_b && hq_b->level < custom_hq_max_level) {
+        if (hq_b && hq_b->level < custom_hq_max_level && !hq_fast_tracked) {
             bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == hq_b->region) enemy_present = true;
             bool already_planned = false; 
             for(auto const& [wid, plan] : build_plans) if (plan.first == hq_b->region) already_planned = true;
@@ -1578,8 +1577,7 @@ public:
             }
         }
 
-        // 3. Chỉ đưa Base Upgrade vào danh sách ứng viên nếu CHƯA ĐẠT lợi thế
-        if (!labor_advantage) {
+        if (!is_rushing_hq) {
             for (const auto& b : my_bases) {
                 bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == b.region) enemy_present = true;
                 bool already_planned = false; 
@@ -1677,7 +1675,10 @@ public:
             if (is_opp_base || is_maxed) { it = build_plans.erase(it); continue; }
 
             if (w_copy.region == target_region && w_copy.state == WState::STATIONARY) {
-                if (virtual_gold >= actual_cost + total_upkeep) {
+                // KIỂM TRA: Khu vực này chưa có lệnh nâng cấp nào trong lượt này
+                bool already_upgrading = std::find(a.upgrades.begin(), a.upgrades.end(), target_region) != a.upgrades.end();
+                
+                if (!already_upgrading && virtual_gold >= actual_cost + total_upkeep) {
                     a.upgrades.push_back(target_region);
                     virtual_gold -= actual_cost;
                     int added_slots = (!is_my_base) ? BASE_LEVELS[1].work_cap : 
@@ -1699,6 +1700,53 @@ public:
             } else it = persistent_jobs.erase(it); 
         }
 
+        // Real-time scan: Cắt cử nhân sự lấp vào base hiện tại nếu labor đang chưa áp đảo
+        if (!has_labor_advantage) {
+            std::vector<int> bases_to_check;
+            if (hq_b) bases_to_check.push_back(hq_b->region);
+            for (const auto& b : my_bases) bases_to_check.push_back(b.region);
+
+            for (int reg : bases_to_check) {
+                int work_cap = 0;
+                for (const auto& b : S.buildings) {
+                    if (b.region == reg && b.side == M.my_side) {
+                        work_cap = b.work_cap(); break;
+                    }
+                }
+
+                int current_workers = 0;
+                for (const auto& w : my_warriors) {
+                    if (w.region == reg || (persistent_jobs.count(w.id) && persistent_jobs[w.id] == reg)) {
+                        current_workers++;
+                    }
+                }
+
+                while (current_workers < work_cap) {
+                    std::vector<Warrior> current_free = get_free_units(S);
+                    if (current_free.empty()) break;
+
+                    int best_w = -1; int min_h = 9999;
+                    int free_count = current_free.size();
+                    for (size_t i = 0; i < current_free.size(); ++i) {
+                        if (!is_safe_to_dispatch(current_free[i], reg, free_count, M, P)) continue;
+                        int h = get_hops(P, current_free[i].region, reg);
+                        if (h < min_h) { min_h = h; best_w = i; }
+                    }
+
+                    if (best_w != -1) {
+                        persistent_jobs[current_free[best_w].id] = reg;
+                        current_workers++;
+                        if (virtual_job_slots.count(reg) && virtual_job_slots[reg] > 0) {
+                            virtual_job_slots[reg]--;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Normal fallback: Chạy tiếp cho các virtual slots còn lại
         std::vector<Warrior> free_units = get_free_units(S);
         int current_free_count = free_units.size();
 
@@ -1842,6 +1890,29 @@ public:
         Actions a;
         update_state_and_clean_dead(S, M, P); 
         
+        int my_labor = get_total_labor(S, M);
+        int opp_labor = get_enemy_total_labor(S, M);
+        has_labor_advantage = (my_labor > opp_labor + TUNE_LABOR_ADVANTAGE_THRESHOLD);
+        
+        bool cond1 = (opp_hq_b && hq_b && opp_hq_b->level > hq_b->level && my_labor >= opp_labor);
+        is_rushing_hq = (cond1 || has_labor_advantage);
+
+        bool hq_fast_tracked = false;
+        if (is_rushing_hq && hq_b && hq_b->level < custom_hq_max_level) {
+            bool has_unit_at_hq = false;
+            for (const auto& w : my_warriors) {
+                if (w.region == M.my_hq) { has_unit_at_hq = true; break; }
+            }
+            if (has_unit_at_hq) {
+                int cost = HQ_LEVELS[hq_b->level + 1].upgrade_cost;
+                if (virtual_gold >= cost + total_upkeep) {
+                    a.upgrades.push_back(M.my_hq);
+                    virtual_gold -= cost;
+                    hq_fast_tracked = true;
+                }
+            }
+        }
+
         plan_forward_expansion(S, M, P);
         process_forward_build_plans(S, M, P, a);
 
@@ -1856,7 +1927,7 @@ public:
                 detect_and_handle_emergencies(S, M, P); 
         }
         
-        plan_expansion(S, M, P);
+        plan_expansion(S, M, P, hq_fast_tracked);
         process_build_plans(S, M, P, a);
         assign_jobs_to_free_units(S, M, P);
         
