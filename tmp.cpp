@@ -248,7 +248,7 @@ public:
     const double TUNE_WEAK_BASE_BONUS = 150.0;    
     const double TUNE_HQ_TARGET_BONUS = 0.0;      
     const double TUNE_MAX_ARMY_RATIO = 0.7;       
-    const int TUNE_LABOR_ADVANTAGE_THRESHOLD = 3;
+    const int TUNE_LABOR_ADVANTAGE_THRESHOLD = 5;
     const int TUNE_MIN_LABOR_TO_FIGHT = 3; 
     const int TUNE_MAX_CONCURRENT_BUILDS = 2;
     const int TUNE_MAX_CONCURRENT_ATTACKS = 2; 
@@ -1388,7 +1388,8 @@ public:
     }
 
     void plan_forward_expansion(const GameState &S, const GameMap &M, const Paths &P) {
-        if (get_total_labor(S, M) > get_enemy_total_labor(S, M) + TUNE_LABOR_ADVANTAGE_THRESHOLD) return; 
+        // Nếu đã đạt lợi thế lao động -> Không xây thêm base tiền phương
+        if (get_total_labor(S, M) >= get_enemy_total_labor(S, M) + TUNE_LABOR_ADVANTAGE_THRESHOLD) return; 
 
         int current_builds = build_plans.size() + forward_build_plans.size();
         if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) return; 
@@ -1479,7 +1480,8 @@ public:
     }
 
     void plan_expansion(const GameState &S, const GameMap &M, const Paths &P) {
-        if (get_total_labor(S, M) > get_enemy_total_labor(S, M) + TUNE_LABOR_ADVANTAGE_THRESHOLD) return; 
+        // Kiểm tra xem đã đạt lợi thế lao động chưa
+        bool labor_advantage = get_total_labor(S, M) >= get_enemy_total_labor(S, M) + TUNE_LABOR_ADVANTAGE_THRESHOLD;
 
         int current_builds = build_plans.size() + forward_build_plans.size();
         if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) return; 
@@ -1491,6 +1493,7 @@ public:
             int region; int cost; bool is_hq; bool is_new_base; 
             int dist_to_my_hq; int priority; 
             bool operator<(const PlanCandidate& o) const {
+                // Giữ NGUYÊN BẢN quy tắc sắp xếp của bạn: is_new_base > cost > priority
                 if (is_new_base != o.is_new_base) return is_new_base > o.is_new_base;
                 if (cost != o.cost) return cost < o.cost;
                 if (priority != o.priority) return priority < o.priority;
@@ -1538,26 +1541,30 @@ public:
             if (is_new) future_base_count++;
         }
 
-        for (int sh : M.strongholds) {
-            bool has_b = false; for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
-            bool already_planned = false; 
-            for(auto const& [wid, plan] : build_plans) if (plan.first == sh) already_planned = true;
-            for(auto const& [wid, plan] : forward_build_plans) if (plan.first == sh) already_planned = true;
-            
-            bool unit_standing_here = false;
-            for (const auto& w : free_units) { if (w.region == sh) { unit_standing_here = true; break; } }
+        // 1. Chỉ đưa Base mới vào danh sách ứng viên nếu CHƯA ĐẠT lợi thế
+        if (!labor_advantage) {
+            for (int sh : M.strongholds) {
+                bool has_b = false; for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
+                bool already_planned = false; 
+                for(auto const& [wid, plan] : build_plans) if (plan.first == sh) already_planned = true;
+                for(auto const& [wid, plan] : forward_build_plans) if (plan.first == sh) already_planned = true;
+                
+                bool unit_standing_here = false;
+                for (const auto& w : free_units) { if (w.region == sh) { unit_standing_here = true; break; } }
 
-            if (!has_b && !already_planned) {
-                bool is_my_half = get_hops(P, sh, M.my_hq) < get_hops(P, sh, M.opp_hq);
-                if (sh == M.center_region || is_my_half || is_stronghold_safe(S, M, P, sh) || unit_standing_here) {
-                    PlanCandidate c; c.region = sh; c.cost = 300; c.is_hq = false; c.is_new_base = true; 
-                    c.dist_to_my_hq = get_hops(P, sh, M.my_hq); 
-                    if (future_base_count == 0) c.priority = 1; else c.priority = (sh == M.center_region) ? 1 : 2; 
-                    cands.push_back(c);
+                if (!has_b && !already_planned) {
+                    bool is_my_half = get_hops(P, sh, M.my_hq) < get_hops(P, sh, M.opp_hq);
+                    if (sh == M.center_region || is_my_half || is_stronghold_safe(S, M, P, sh) || unit_standing_here) {
+                        PlanCandidate c; c.region = sh; c.cost = 300; c.is_hq = false; c.is_new_base = true; 
+                        c.dist_to_my_hq = get_hops(P, sh, M.my_hq); 
+                        if (future_base_count == 0) c.priority = 1; else c.priority = (sh == M.center_region) ? 1 : 2; 
+                        cands.push_back(c);
+                    }
                 }
             }
         }
 
+        // 2. LUÔN xét nâng cấp HQ nếu chưa đạt max level
         if (hq_b && hq_b->level < custom_hq_max_level) {
             bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == hq_b->region) enemy_present = true;
             bool already_planned = false; 
@@ -1571,23 +1578,26 @@ public:
             }
         }
 
-        for (const auto& b : my_bases) {
-            bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == b.region) enemy_present = true;
-            bool already_planned = false; 
-            for(auto const& [wid, plan] : build_plans) if (plan.first == b.region) already_planned = true;
-            for(auto const& [wid, plan] : forward_build_plans) if (plan.first == b.region) already_planned = true;
-            
-            if (!already_planned && !enemy_present) {
-                if (b.level == 1 && planned_to_lv2 < max_to_lv2) {
-                    PlanCandidate c; c.region = b.region; c.cost = BASE_LEVELS[2].cost;
-                    c.is_hq = false; c.is_new_base = false; c.dist_to_my_hq = get_hops(P, b.region, M.my_hq); 
-                    c.priority = (b.region == M.center_region) ? 2 : 3; 
-                    cands.push_back(c); planned_to_lv2++; 
-                } else if (b.level == 2 && planned_to_lv3 < max_to_lv3) {
-                    PlanCandidate c; c.region = b.region; c.cost = BASE_LEVELS[3].cost;
-                    c.is_hq = false; c.is_new_base = false; c.dist_to_my_hq = get_hops(P, b.region, M.my_hq); 
-                    c.priority = (b.region == M.center_region) ? 2 : 3; 
-                    cands.push_back(c); planned_to_lv3++;
+        // 3. Chỉ đưa Base Upgrade vào danh sách ứng viên nếu CHƯA ĐẠT lợi thế
+        if (!labor_advantage) {
+            for (const auto& b : my_bases) {
+                bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == b.region) enemy_present = true;
+                bool already_planned = false; 
+                for(auto const& [wid, plan] : build_plans) if (plan.first == b.region) already_planned = true;
+                for(auto const& [wid, plan] : forward_build_plans) if (plan.first == b.region) already_planned = true;
+                
+                if (!already_planned && !enemy_present) {
+                    if (b.level == 1 && planned_to_lv2 < max_to_lv2) {
+                        PlanCandidate c; c.region = b.region; c.cost = BASE_LEVELS[2].cost;
+                        c.is_hq = false; c.is_new_base = false; c.dist_to_my_hq = get_hops(P, b.region, M.my_hq); 
+                        c.priority = (b.region == M.center_region) ? 2 : 3; 
+                        cands.push_back(c); planned_to_lv2++; 
+                    } else if (b.level == 2 && planned_to_lv3 < max_to_lv3) {
+                        PlanCandidate c; c.region = b.region; c.cost = BASE_LEVELS[3].cost;
+                        c.is_hq = false; c.is_new_base = false; c.dist_to_my_hq = get_hops(P, b.region, M.my_hq); 
+                        c.priority = (b.region == M.center_region) ? 2 : 3; 
+                        cands.push_back(c); planned_to_lv3++;
+                    }
                 }
             }
         }
