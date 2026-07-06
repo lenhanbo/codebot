@@ -244,20 +244,21 @@ public:
     const int RESERVE_GOLD_ATTACK = 50; 
     const double TUNE_SCORE_REQ_WEIGHT = 10.0;    
     const double TUNE_SCORE_DIST_WEIGHT = 1.0;    
-    const double TUNE_BASE_TARGET_BONUS = 500.0;   
+    const double TUNE_BASE_TARGET_BONUS = 200.0;   
     const double TUNE_WEAK_BASE_BONUS = 150.0;    
     const double TUNE_HQ_TARGET_BONUS = 0.0;      
     const double TUNE_MAX_ARMY_RATIO = 0.9;       
     const int TUNE_GOLD_ADVANTAGE = 45;
     const int TUNE_MIN_LABOR_TO_FIGHT = 3; 
     const int TUNE_MIN_NET_INCOME_TO_ATTACK = 50; 
-    const int TUNE_MAX_CONCURRENT_BUILDS = 2;
+    const int TUNE_MAX_CONCURRENT_BUILDS = 3;
     const int TUNE_MAX_CONCURRENT_ATTACKS = 4;
     const double TUNE_ENEMY_IN_MY_HALF_BONUS = 100000.0;
     
-    // [THÊM MỚI] Hai hằng số cho cơ chế Snowball
-    const int TUNE_SNOWBALL_INCOME_GAP = 75;      // Chênh lệch Net Income để bật mode "Lấy thịt đè người"
-    const int TUNE_SNOWBALL_BUFFER = 5;           // Lượng lính cộng thêm cho chắc cú khi snowball
+    // Snowball / Attack parameters
+    const int TUNE_SNOWBALL_INCOME_GAP = 75;      
+    const int TUNE_SNOWBALL_BUFFER = 5;           
+    const int TUNE_MISSION_TIMEOUT = 30;          // Cơ chế timeout cho nhiệm vụ đánh
     
     int max_bases_to_build = 0;
     int max_bases_to_upgrade = 0;
@@ -286,6 +287,7 @@ public:
         int created_turn = 0;
         bool is_launched = false; 
         std::set<WarriorId> squad_ids;
+        int reserved_gold = 0; // Quỹ đen xin ứng trước để di chuyển cuối cùng
     };
     std::vector<AttackMission> active_missions; 
     
@@ -473,6 +475,103 @@ public:
         return E;
     }
 
+    // --- CƠ CHẾ BASE RACE CHUYÊN BIỆT CHO HQ ---
+    // Kiểm tra giả định "Nếu ta All-in HQ địch, địch All-in HQ ta, bên nào thắng?"
+    bool simulate_base_race(const GameState& S, const GameMap& M, const Paths& P, int A, int rp) const {
+        int d_us = get_hops(P, rp, M.opp_hq);
+        if (d_us == 999) return false;
+        
+        int opp_hq_hp = opp_hq_b ? opp_hq_b->hp : 10;
+        int opp_hq_ad = get_b_ad(S, M.opp_hq);
+        int opp_troop_hp = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
+        
+        int initial_defending_hp = 0, initial_defending_units = 0;
+        for (const auto& ew : enemy_warriors) {
+            if (ew.region == M.opp_hq) {
+                initial_defending_hp += ew.hp;
+                initial_defending_units++;
+            }
+        }
+        
+        int my_troop_hp = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
+        
+        // Mô phỏng số turn ta phá hủy được HQ địch
+        auto calc_T_win = [&]() -> int {
+            int e_hp_pool = initial_defending_hp;
+            int e_units = initial_defending_units;
+            int cur_base_hp = opp_hq_hp;
+            int my_hp_pool = A * my_troop_hp;
+            int my_units = A;
+            
+            for(int day = 0; day < 200; ++day) {
+                if (day >= d_us) {
+                    int dmg_to_us = (cur_base_hp > 0 ? opp_hq_ad : 0) + e_units;
+                    int dmg_to_them = my_units;
+                    
+                    e_hp_pool -= dmg_to_them;
+                    if (e_hp_pool < 0) {
+                        cur_base_hp += e_hp_pool;
+                        e_hp_pool = 0;
+                    }
+                    e_units = (e_hp_pool > 0) ? ((e_hp_pool + opp_troop_hp - 1) / opp_troop_hp) : 0;
+                    
+                    my_hp_pool -= dmg_to_us;
+                    my_units = my_hp_pool > 0 ? ((my_hp_pool + my_troop_hp - 1) / my_troop_hp) : 0;
+                    
+                    if (cur_base_hp <= 0) return day;
+                    if (my_hp_pool <= 0) return 999;
+                }
+            }
+            return 999;
+        };
+        
+        int T_us = calc_T_win();
+        if (T_us == 999) return false; 
+        
+        int total_e_hp = 0, total_e_units = 0, min_d_them = 999;
+        for (const auto& ew : enemy_warriors) {
+            if (ew.region != M.opp_hq) { 
+                total_e_hp += ew.hp;
+                total_e_units++;
+                int d = get_hops(P, ew.region, M.my_hq);
+                if (d < min_d_them) min_d_them = d;
+            }
+        }
+        if (total_e_units == 0) return true; 
+        if (min_d_them == 999) return true;
+        
+        int my_hq_hp_sim = hq_b ? hq_b->hp : 10;
+        int my_hq_ad = get_b_ad(S, M.my_hq);
+        
+        // Mô phỏng số turn địch phá được HQ ta (Giả sử xấu nhất ta KHÔNG phòng thủ)
+        auto calc_T_lose = [&]() -> int {
+            int cur_base_hp = my_hq_hp_sim;
+            int e_hp_pool = total_e_hp;
+            int e_units = total_e_units;
+            
+            for(int day = 0; day < 200; ++day) {
+                if (day >= min_d_them) {
+                    int dmg_to_them = (cur_base_hp > 0 ? my_hq_ad : 0);
+                    int dmg_to_us = e_units;
+                    
+                    cur_base_hp -= dmg_to_us;
+                    
+                    e_hp_pool -= dmg_to_them;
+                    e_units = e_hp_pool > 0 ? ((e_hp_pool + opp_troop_hp - 1) / opp_troop_hp) : 0;
+                    
+                    if (cur_base_hp <= 0) return day;
+                    if (e_hp_pool <= 0) return 999;
+                }
+            }
+            return 999;
+        };
+        
+        int T_them = calc_T_lose();
+        
+        // Nếu ta phá xong trước hoặc cùng lúc, thì chiến thuật Race thành công
+        return T_us <= T_them;
+    }
+
     bool is_safe_against_all_in(const GameState &S, const GameMap &M, const Paths &P, 
                                 int target_region, int build_cost, bool is_new_base, int d_build) {
         
@@ -619,43 +718,16 @@ public:
         return true; 
     }
 
-    int get_locked_move_gold(const GameState& S, const GameMap& M) const {
-        int locked = 0;
-        for (const auto& m : active_missions) {
-            for (auto wid : m.squad_ids) {
-                bool found = false;
-                int w_region = -1;
-                for (const auto& w : my_warriors) {
-                    if (w.id == wid) { w_region = w.region; found = true; break; }
-                }
-                // Nếu lính chưa tới đích, dự trữ sẵn 10 vàng MOVE_COST
-                if (found && w_region != m.target) {
-                    bool target_is_my_base = false;
-                    for (const auto& b : S.buildings) {
-                        if (b.region == m.target && b.side == M.my_side) { target_is_my_base = true; break; }
-                    }
-                    if (!target_is_my_base) {
-                        locked += MOVE_COST;
-                    }
-                }
-            }
-        }
-        return locked;
-    }
-    int get_locked_build_gold() const {
+    int get_locked_gold() const {
         int locked = 0;
         for (const auto& p : build_plans) locked += p.second.second;
         for (const auto& p : forward_build_plans) locked += p.second.second; 
         return locked;
     }
-    int get_locked_gold(const GameState& S, const GameMap& M) const {
-        return get_locked_build_gold() + get_locked_move_gold(S, M);
-    }
     
-    // [SỬA LẠI] Truyền thêm S, M vào hàm này
-    int get_spendable_gold(const GameState& S, const GameMap& M) const {
+    int get_spendable_gold() const {
         int emergency_cost = emergency_train_queue * TRAIN_COST;
-        return virtual_gold - get_locked_gold(S, M) - emergency_cost;
+        return virtual_gold - get_locked_gold() - emergency_cost;
     }
 
     std::vector<Warrior> get_free_units(const GameState& S) const {
@@ -673,9 +745,7 @@ public:
         return free_units;
     }
 
-    // [SỬA LẠI] Thêm tham số GameState& S và cập nhật logic lọc quân địch rảnh rỗi
     bool is_safe_to_dispatch(const GameState& S, const Warrior& w, int tgt, int current_free_count, const GameMap& M, const Paths& P) const {
-        // --- LOGIC MỚI: Tính toán quân địch rảnh rỗi (giống is_safe_against_all_in) ---
         int total_enemy = enemy_warriors.size();
         int enemy_labor = 0;
         for (const auto& b : S.buildings) {
@@ -688,7 +758,6 @@ public:
 
         int attacking_bases_count = 0;
         for (const auto& g : active_enemy_attacks) {
-            // Những quân địch đang đi tấn công base khác (không nhắm vào HQ ta) thì không tính
             if (g.potential_targets.find(M.my_hq) == g.potential_targets.end()) {
                 attacking_bases_count += g.ids.size();
             }
@@ -707,10 +776,8 @@ public:
         int hq_ad = get_b_ad(S, M.my_hq);
         int hq_hp = hq_b ? hq_b->hp : 10;
         
-        // Tính ra lượng quân thực tế cần để thủ HQ hiện tại
         int dynamic_req_defenders = calculate_min_defenders(baseline_invading_enemies, e_hp, hq_hp, hq_ad, m_hp);
 
-        // --- ĐIỀU KIỆN CŨ ---
         int free_after = current_free_count - 1;
         int trip_time = 2 * get_hops(P, w.region, tgt);
         int max_dist = get_hops(P, M.center_region, M.opp_hq) + 1;
@@ -718,17 +785,12 @@ public:
         return (free_after >= dynamic_req_defenders) || (trip_time <= max_dist);
     }
 
-    // [SỬA LẠI] Cập nhật: Chỉ skip tính toán phòng thủ đối với Base, không skip đối với HQ.
     int calculate_req_attackers(int final_target, int dist_from_us, const GameState& S, const GameMap& M, const Paths& P) const {
         bool is_hq = (final_target == M.opp_hq);
 
-        // ========================================================
-        // LOGIC MỚI: KIỂM TRA SNOWBALL - KINH TẾ VƯỢT TRỘI (CHỈ CHO BASE)
-        // ========================================================
         int my_net_income = get_my_net_income(S, M, my_warriors.size());
         int opp_net_income = get_enemy_net_income(S, M, enemy_warriors.size());
 
-        // CHỈ bỏ qua mô phỏng 50 turn nếu mục tiêu KHÔNG PHẢI là HQ
         if (!is_hq && my_net_income - opp_net_income >= TUNE_SNOWBALL_INCOME_GAP) {
             int b_hp = 0;
             for (const auto& b : S.buildings) {
@@ -745,15 +807,10 @@ public:
             
             int my_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
             
-            // Heuristic chớp nhoáng: Lính địch tại chỗ + (Máu base / máu lính mình) + Buffer
             int required = defending_enemies + (b_hp + my_hp_val - 1) / my_hp_val + TUNE_SNOWBALL_BUFFER;
-            
             return required;
         }
 
-        // ========================================================
-        // PHẦN MÔ PHỎNG 50 TURN CŨ (Bắt buộc dùng cho HQ hoặc khi chưa Snowball)
-        // ========================================================
         int my_hp = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
         int b_hp = 0, b_ad = 0;
 
@@ -858,7 +915,7 @@ public:
                         cur_base_hp += e_hp_pool;
                         e_hp_pool = 0;
                     }
-                    e_units = (e_hp_pool + opp_hp_per_unit - 1) / opp_hp_per_unit;
+                    e_units = (e_hp_pool > 0) ? ((e_hp_pool + opp_hp_per_unit - 1) / opp_hp_per_unit) : 0;
                     
                     my_hp_pool -= dmg_to_us;
                     my_units = my_hp_pool > 0 ? (my_hp_pool + my_hp - 1) / my_hp : 0;
@@ -910,7 +967,14 @@ public:
         }
         
         total_upkeep = my_warriors.size() * UPKEEP_PER_WARRIOR;
+        
+        // [SỬA LỖI Ở ĐÂY] Tách bạch Quỹ chung và Quỹ đen ngay từ đầu lượt
         virtual_gold = S.gold; 
+        for (const auto& m : active_missions) {
+            virtual_gold -= m.reserved_gold;
+        }
+        if (virtual_gold < 0) virtual_gold = 0; // Đề phòng bug lạ
+
         has_trained = false;
         emergency_train_queue = 0;
         pending_train_requests = 0;
@@ -1157,7 +1221,7 @@ public:
         std::vector<Warrior> available_defenders = get_free_units(S);
         int train_cap_per_turn = hq_b ? hq_b->train_cap() : 1;
         
-        int sim_gold = get_spendable_gold(S, M); 
+        int sim_gold = get_spendable_gold(); 
         int my_inc = std::max(0, get_my_gross_income(S, M) - total_upkeep); 
 
         for (const auto& threat : active_threats) {
@@ -1389,21 +1453,31 @@ public:
             else gathering_targets.insert(m.target);
         }
 
+        // ============================================
+        // 1. CẬP NHẬT CÁC NHIỆM VỤ HIỆN CÓ
+        // ============================================
         for (auto it = active_missions.begin(); it != active_missions.end(); ) {
             bool target_alive = (it->target == M.opp_hq);
             if (!target_alive) {
                 for (auto& b : S.buildings) if (b.region == it->target && b.side != M.my_side) target_alive = true; 
             }
+            
+            // Nếu hủy do mất target hoặc đã tung quân nhưng chết sạch lính -> Hoàn trả tiền
             if (!target_alive || (it->is_launched && it->squad_ids.empty())) { 
-                it = active_missions.erase(it); continue; 
+                virtual_gold += it->reserved_gold;
+                it = active_missions.erase(it); 
+                continue; 
             }
             
             if (it->is_launched) {
                 ++it; continue;
             }
 
-            if (!it->is_launched && turn - it->created_turn > 30) {
-                it = active_missions.erase(it); continue;
+            // Xử lý Timeout -> Hoàn trả tiền
+            if (!it->is_launched && turn - it->created_turn > TUNE_MISSION_TIMEOUT) {
+                virtual_gold += it->reserved_gold;
+                it = active_missions.erase(it); 
+                continue;
             }
             
             int rp_dist_to_original_tgt = get_hops(P, it->rally_point, it->target);
@@ -1417,6 +1491,18 @@ public:
                 }
             }
             int ready_count = ready_wids.size();
+
+            // Rút quỹ đen khi lính đứng chờ ở Rally Point
+            int target_reserve = ready_count * MOVE_COST;
+            if (it->reserved_gold < target_reserve) {
+                int diff = target_reserve - it->reserved_gold;
+                int transfer = std::min(virtual_gold, diff);
+                it->reserved_gold += transfer;
+                virtual_gold -= transfer;
+            } else if (it->reserved_gold > target_reserve) {
+                virtual_gold += (it->reserved_gold - target_reserve);
+                it->reserved_gold = target_reserve;
+            }
 
             struct TargetCand { int tgt; int req; double score; };
             TargetCand best_cand = {-1, 99999, -9999999.0};
@@ -1434,7 +1520,6 @@ public:
                 for (int tgt : potential_pivot_targets) {
                     int dist = get_hops(P, it->rally_point, tgt);
                     if (dist == 999) continue;
-                    
                     if (tgt != it->target && locked_targets.count(tgt)) continue; 
                     
                     int req = calculate_req_attackers(tgt, dist, S, M, P);
@@ -1458,7 +1543,8 @@ public:
                 }
             }
 
-            if (best_cand.tgt != -1) {
+            // Chuyển mục tiêu nếu tìm được mồi ngon hơn, NHƯNG chỉ khi đủ quỹ đen cho mục tiêu mới
+            if (best_cand.tgt != -1 && it->reserved_gold >= best_cand.req * MOVE_COST) {
                 if (it->is_launched) locked_targets.erase(it->target);
                 else gathering_targets.erase(it->target);
 
@@ -1473,13 +1559,24 @@ public:
                 for (int i = 0; i < best_cand.req; i++) {
                     it->squad_ids.insert(ready_wids[i]);
                 }
-                
                 current_free_count += (old_size - best_cand.req);
-
+                
+                int new_target_reserve = best_cand.req * MOVE_COST;
+                if (it->reserved_gold > new_target_reserve) {
+                    virtual_gold += (it->reserved_gold - new_target_reserve);
+                    it->reserved_gold = new_target_reserve;
+                }
             } else {
                 it->required_attackers = calculate_req_attackers(it->target, rp_dist_to_original_tgt, S, M, P);
                 
-                if (ready_count >= it->required_attackers && it->required_attackers > 0) {
+                bool is_hq = (it->target == M.opp_hq);
+                bool can_base_race = false;
+                if (is_hq) can_base_race = simulate_base_race(S, M, P, it->required_attackers, it->rally_point);
+
+                int needed_gold = it->required_attackers * MOVE_COST;
+
+                // CHECK KÉP: ĐỦ LÍNH VÀ ĐỦ TIỀN MỚI XUẤT KÍCH
+                if (ready_count >= it->required_attackers && it->required_attackers > 0 && it->reserved_gold >= needed_gold) {
                     if (!it->is_launched) {
                         gathering_targets.erase(it->target);
                         locked_targets.insert(it->target);
@@ -1492,11 +1589,16 @@ public:
                     for (int i = 0; i < it->required_attackers; i++) {
                         it->squad_ids.insert(ready_wids[i]);
                     }
-                    
                     current_free_count += (old_size - it->required_attackers);
+                    
+                    if (it->reserved_gold > needed_gold) {
+                        virtual_gold += (it->reserved_gold - needed_gold);
+                        it->reserved_gold = needed_gold;
+                    }
                 } else {
                     int current_squad_size = it->squad_ids.size();
-                    if (current_squad_size < it->required_attackers && !is_rushing_hq) {
+                    // Thiếu lính -> Tìm gọi thêm
+                    if (current_squad_size < it->required_attackers) {
                         std::vector<Warrior> atk_units = get_attack_free_units();
                         std::sort(atk_units.begin(), atk_units.end(), [&](const Warrior& a, const Warrior& b) {
                             return get_hops(P, a.region, it->rally_point) < get_hops(P, b.region, it->rally_point);
@@ -1504,8 +1606,9 @@ public:
                         
                         for (auto& w : atk_units) {
                             if (current_squad_size >= it->required_attackers) break;
-                            // [SỬA LẠI] Gọi hàm có thêm biến S
-                            if (!is_safe_to_dispatch(S, w, it->target, current_free_count, M, P)) continue;
+                            if (!(is_hq && can_base_race)) {
+                                if (!is_safe_to_dispatch(S, w, it->target, current_free_count, M, P)) continue;
+                            }
                             it->squad_ids.insert(w.id); 
                             current_squad_size++;
                             current_free_count--; 
@@ -1515,7 +1618,9 @@ public:
                                 pending_train_requests += (it->required_attackers - current_squad_size);
                             }
                         }
-                    } else if (current_squad_size > it->required_attackers) {
+                    } 
+                    // Nếu đủ lính nhưng THIẾU TIỀN, hoặc thừa lính do thay đổi required_attackers -> Cắt giảm phần thừa
+                    else if (current_squad_size > it->required_attackers) {
                         std::vector<Warrior> squad_units;
                         for(auto wid : it->squad_ids) {
                             for(auto& w : my_warriors) if(w.id == wid) squad_units.push_back(w);
@@ -1535,7 +1640,10 @@ public:
             ++it;
         }
 
-        int spendable_gold = get_spendable_gold(S, M); 
+        // ============================================
+        // 2. KHỞI TẠO CÁC NHIỆM VỤ MỚI
+        // ============================================
+        int spendable_gold = get_spendable_gold(); 
         std::vector<Warrior> temp_check_units = get_attack_free_units();
         int idle_army_count = temp_check_units.size(); 
 
@@ -1550,18 +1658,17 @@ public:
                 }
             }
 
+            // Target nhanh cho base nhỏ lân cận
             std::vector<Warrior> atk_units_fast = get_attack_free_units();
             std::map<int, std::vector<Warrior>> free_by_region;
             for (auto& w : atk_units_fast) {
-                // [SỬA LẠI] Gọi hàm có thêm biến S
-                if (is_safe_to_dispatch(S, w, M.opp_hq, current_free_count, M, P)) {
-                    free_by_region[w.region].push_back(w);
-                }
+                free_by_region[w.region].push_back(w);
             }
             
             for (int tgt : potential_targets) {
                 if (active_missions.size() >= TUNE_MAX_CONCURRENT_ATTACKS) break;
-                
+                bool is_hq = (tgt == M.opp_hq);
+
                 for (auto& [reg, group] : free_by_region) {
                     if (group.empty()) continue;
                     
@@ -1569,22 +1676,45 @@ public:
                     if (dist == 999) continue;
                     
                     int req = calculate_req_attackers(tgt, dist, S, M, P);
+                    bool can_base_race = false;
+                    if (is_hq) can_base_race = simulate_base_race(S, M, P, req, reg);
+
+                    std::vector<Warrior> valid_group;
+                    int temp_free = current_free_count;
+                    for(auto& w : group) {
+                        if ((is_hq && can_base_race) || is_safe_to_dispatch(S, w, tgt, temp_free, M, P)) {
+                            valid_group.push_back(w);
+                            temp_free--;
+                        }
+                    }
                     
-                    if (group.size() >= req && req <= 100) {
+                    if (valid_group.size() >= req && req <= 100) {
                         AttackMission m;
                         m.target = tgt;
                         m.rally_point = reg;
                         m.required_attackers = req;
-                        m.is_launched = true; 
                         m.created_turn = turn;
                         
                         for (int i = 0; i < req; ++i) {
-                            m.squad_ids.insert(group[i].id);
+                            m.squad_ids.insert(valid_group[i].id);
                             current_free_count--;
                         }
+                        
+                        int transfer = std::min(virtual_gold, req * MOVE_COST);
+                        m.reserved_gold += transfer;
+                        virtual_gold -= transfer;
+
+                        // Check đủ tiền mới launch
+                        if (m.reserved_gold >= req * MOVE_COST) {
+                            m.is_launched = true;
+                            locked_targets.insert(tgt); 
+                        } else {
+                            m.is_launched = false;
+                            gathering_targets.insert(tgt);
+                        }
+
                         group.erase(group.begin(), group.begin() + req);
                         active_missions.push_back(m);
-                        locked_targets.insert(tgt); 
                         break; 
                     }
                 }
@@ -1655,10 +1785,7 @@ public:
                 if (available == 0 && spendable_gold < TRAIN_COST) break; 
                 
                 int train_shortage = std::max(0, opt.req - available);
-                
-                if (train_shortage > 0 && current_net_income < TUNE_MIN_NET_INCOME_TO_ATTACK) {
-                    continue; 
-                }
+                if (train_shortage > 0 && current_net_income < TUNE_MIN_NET_INCOME_TO_ATTACK) continue; 
                 
                 int budget = (train_shortage * TRAIN_COST) + (done_building ? 0 : RESERVE_GOLD_ATTACK);
                 
@@ -1671,11 +1798,16 @@ public:
                         return get_hops(P, a.region, opt.rp) < get_hops(P, b.region, opt.rp);
                     });
                     
+                    bool is_hq = (opt.tgt == M.opp_hq);
+                    bool can_base_race = false;
+                    if (is_hq) can_base_race = simulate_base_race(S, M, P, opt.req, opt.rp);
+
                     int drafted = 0;
                     for (auto it = atk_units.begin(); it != atk_units.end(); ) {
                         if (drafted >= m.required_attackers) break;
-                        // [SỬA LẠI] Gọi hàm có thêm biến S
-                        if (!is_safe_to_dispatch(S, *it, opt.tgt, current_free_count, M, P)) { ++it; continue; }
+                        if (!(is_hq && can_base_race)) {
+                            if (!is_safe_to_dispatch(S, *it, opt.tgt, current_free_count, M, P)) { ++it; continue; }
+                        }
                         
                         m.squad_ids.insert(it->id); 
                         drafted++;
@@ -1690,15 +1822,21 @@ public:
                         }
                     }
 
-                    if (ready_at_rally >= m.required_attackers && m.required_attackers > 0) {
+                    // Xin tiền quỹ đen cho những người đã có mặt ở Rally
+                    int transfer = std::min(virtual_gold, ready_at_rally * MOVE_COST);
+                    m.reserved_gold += transfer;
+                    virtual_gold -= transfer;
+
+                    // Chỉ tung khi đủ lính + đủ 100% tiền
+                    if (ready_at_rally >= m.required_attackers && m.required_attackers > 0 && m.reserved_gold >= m.required_attackers * MOVE_COST) {
                         m.is_launched = true;
                         locked_targets.insert(opt.tgt); 
                     } else {
                         pending_train_requests += train_shortage;
                         gathering_targets.insert(opt.tgt); 
                     }
+
                     spendable_gold -= budget; 
-                    spendable_gold -= (drafted * MOVE_COST);
                     active_missions.push_back(m);
                 }
             }
@@ -1744,7 +1882,7 @@ public:
         for (const auto& cand : cands) {
             if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) break;
             
-            int base_budget = get_spendable_gold(S, M);
+            int base_budget = get_spendable_gold();
             if (base_budget >= BASE_LEVELS[1].cost) {
                     forward_build_plans[cand.wid] = {cand.region, BASE_LEVELS[1].cost};
                     current_builds++;
@@ -1771,11 +1909,11 @@ public:
             if (b) { it = forward_build_plans.erase(it); continue; } 
 
             int actual_cost = BASE_LEVELS[1].cost;
-            int reserved_move = get_locked_move_gold(S, M); // [THÊM MỚI] Lấy quỹ tiền di chuyển
+
             if (w_copy.region == target_region && w_copy.state == WState::STATIONARY) {
                 bool already_upgrading = std::find(a.upgrades.begin(), a.upgrades.end(), target_region) != a.upgrades.end();
                 
-                if (!already_upgrading && (virtual_gold - reserved_move) >= actual_cost + total_upkeep) {
+                if (!already_upgrading && virtual_gold >= actual_cost + total_upkeep) {
                     a.upgrades.push_back(target_region);
                     virtual_gold -= actual_cost;
                     virtual_job_slots[target_region] += BASE_LEVELS[1].work_cap;
@@ -1918,7 +2056,7 @@ public:
         int estimated_income = (persistent_jobs.size() * WORK_INCOME) - (my_warriors.size() * UPKEEP_PER_WARRIOR);
 
         for (const auto& cand : cands) {
-            int base_budget = get_spendable_gold(S, M);
+            int base_budget = get_spendable_gold();
             
             if (free_units.empty()) {
                 int D = cand.dist_to_my_hq;
@@ -1930,7 +2068,6 @@ public:
             
             int best_u = -1; int min_d = 999;
             for (size_t i = 0; i < free_units.size(); i++) {
-                // [SỬA LẠI] Gọi hàm có thêm biến S
                 if (!is_safe_to_dispatch(S, free_units[i], cand.region, current_free_count, M, P)) continue;
                 
                 int d = get_hops(P, free_units[i].region, cand.region);
@@ -1988,11 +2125,11 @@ public:
             }
 
             if (is_opp_base || is_maxed) { it = build_plans.erase(it); continue; }
-            int reserved_move = get_locked_move_gold(S, M); // [THÊM MỚI] Lấy quỹ tiền di chuyển
+
             if (w_copy.region == target_region && w_copy.state == WState::STATIONARY) {
                 bool already_upgrading = std::find(a.upgrades.begin(), a.upgrades.end(), target_region) != a.upgrades.end();
                 
-                if (!already_upgrading && (virtual_gold - reserved_move) >= actual_cost + total_upkeep) {
+                if (!already_upgrading && virtual_gold >= actual_cost + total_upkeep) {
                     a.upgrades.push_back(target_region);
                     virtual_gold -= actual_cost;
                     int added_slots = (!is_my_base) ? BASE_LEVELS[1].work_cap : 
@@ -2041,7 +2178,6 @@ public:
                     int best_w = -1; int min_h = 9999;
                     int free_count = current_free.size();
                     for (size_t i = 0; i < current_free.size(); ++i) {
-                        // [SỬA LẠI] Gọi hàm có thêm biến S
                         if (!is_safe_to_dispatch(S, current_free[i], reg, free_count, M, P)) continue;
                         int h = get_hops(P, current_free[i].region, reg);
                         if (h < min_h) { min_h = h; best_w = i; }
@@ -2072,7 +2208,6 @@ public:
             int best_w = -1, best_j = -1; int min_h = 9999;
             for (size_t i = 0; i < free_units.size(); ++i) {
                 for (size_t j = 0; j < remaining_jobs.size(); ++j) {
-                    // [SỬA LẠI] Gọi hàm có thêm biến S
                     if (!is_safe_to_dispatch(S, free_units[i], remaining_jobs[j], current_free_count, M, P)) continue;
 
                     int h = get_hops(P, free_units[i].region, remaining_jobs[j]);
@@ -2093,7 +2228,7 @@ public:
 
     void execute_training(const GameState &S, const GameMap &M, const Paths &P, Actions &a) {
         int cap = hq_b ? hq_b->train_cap() : 1;
-        int spendable_gold = get_spendable_gold(S, M);
+        int spendable_gold = get_spendable_gold();
         
         if (!has_trained && emergency_train_queue > 0 && virtual_gold >= TRAIN_COST) {
             int act = std::min({emergency_train_queue, cap, virtual_gold / TRAIN_COST});
@@ -2184,17 +2319,37 @@ public:
                 if (is_sync_attack) {
                     int my_dist = get_hops(P, w.region, final_target);
                     int time_left = target_arrival_turn - turn;
-                    if (time_left > my_dist && my_dist != 999) continue; 
-                }
+                    if (target_arrival_turn != -1 && time_left > my_dist && my_dist != 999) continue; 
 
-                int cost = 0;
-                bool final_is_my_base = false;
-                for (const auto& b : S.buildings) if (b.region == final_target && b.side == M.my_side) final_is_my_base = true;
-                if (!final_is_my_base) cost = MOVE_COST;
+                    int cost = 0;
+                    bool final_is_my_base = false;
+                    for (const auto& b : S.buildings) if (b.region == final_target && b.side == M.my_side) final_is_my_base = true;
+                    if (!final_is_my_base) cost = MOVE_COST;
 
-                if((is_emergency && virtual_gold >= cost) || (!is_emergency && virtual_gold >= cost + total_upkeep)) { 
-                    a.moves.push_back({w.id, final_target}); 
-                    virtual_gold -= cost; 
+                    if (cost > 0) {
+                        for (auto& m : active_missions) {
+                            if (m.squad_ids.count(w.id)) {
+                                if (m.reserved_gold >= cost) {
+                                    m.reserved_gold -= cost;
+                                    a.moves.push_back({w.id, final_target});
+                                }
+                                break; 
+                            }
+                        }
+                    } else {
+                        a.moves.push_back({w.id, final_target});
+                    }
+                } else {
+                    int cost = 0;
+                    bool final_is_my_base = false;
+                    for (const auto& b : S.buildings) if (b.region == final_target && b.side == M.my_side) final_is_my_base = true;
+                    if (!final_is_my_base) cost = MOVE_COST;
+
+                    // [ĐÃ TRẢ VỀ NGUYÊN BẢN] Đi chiếm Base hay đi farm đều dùng quỹ chung (virtual_gold)
+                    if((is_emergency && virtual_gold >= cost) || (!is_emergency && virtual_gold >= cost + total_upkeep)) { 
+                        a.moves.push_back({w.id, final_target}); 
+                        virtual_gold -= cost; 
+                    }
                 }
             }
         }
