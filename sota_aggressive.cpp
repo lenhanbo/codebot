@@ -618,7 +618,7 @@ public:
     bool is_safe_against_all_in(const GameState &S, const GameMap &M, const Paths &P, 
                                 int target_region, int build_cost, bool is_new_base, int d_build) {
         
-        int max_t_wait = 35; 
+        int max_t_wait = 20; 
         
         int total_enemy = enemy_warriors.size();
         int enemy_labor = 0;
@@ -1232,7 +1232,6 @@ public:
         };
         std::vector<Threat> active_threats;
 
-        // Chuyển đổi dữ liệu đã tính toán thành danh sách đe dọa
         for (auto const& [tgt, req] : req_per_base) {
             if (req > 0) {
                 int b_level = 1;
@@ -1245,7 +1244,6 @@ public:
             }
         }
 
-        // Ưu tiên: Base bị đe dọa gần nhất -> Độ quan trọng của Base
         std::sort(active_threats.begin(), active_threats.end(), [&](const Threat& a, const Threat& b) {
             if(a.enemy_dist == b.enemy_dist) return a.priority > b.priority;
             return a.enemy_dist < b.enemy_dist;
@@ -1259,12 +1257,30 @@ public:
 
         for (const auto& threat : active_threats) {
             int existing = 0;
+            // 1. Lính chuyên thủ đã được gán nhãn từ trước
             for (auto const& [my_id, my_tgt] : emergency_targets) {
                 if (my_tgt == threat.target) existing++;
             }
+            
+            // 2. [THÊM MỚI] Đếm luôn lính Labor (Farm/Build) đang ở hoặc sẽ về kịp Base này
+            for (const auto& w : my_warriors) {
+                if (!emergency_targets.count(w.id)) {
+                    int job_tgt = -1;
+                    if (persistent_jobs.count(w.id)) job_tgt = persistent_jobs.at(w.id);
+                    else if (build_plans.count(w.id)) job_tgt = build_plans.at(w.id).first;
+                    else if (forward_build_plans.count(w.id)) job_tgt = forward_build_plans.at(w.id).first;
+                    
+                    if (job_tgt == threat.target) {
+                        // Kịp tham chiến thì đếm luôn vào lực lượng phòng thủ
+                        if (get_hops(P, w.region, threat.target) <= threat.enemy_dist + 1) {
+                            existing++;
+                        }
+                    }
+                }
+            }
 
             int needed = threat.req_def - existing;
-            if (needed <= 0) continue; // Nếu đã đủ (hoặc dư) quân thủ thì bỏ qua
+            if (needed <= 0) continue; 
 
             if (threat.req_def > threat.max_cap && threat.target != M.my_hq) {
                 doomed_bases.insert(threat.target);
@@ -1290,15 +1306,52 @@ public:
                 temp_gold += my_inc; 
             }
 
-            int potential_defenders = can_arrive_in_time.size() + future_trainable;
+            int total_available = (int)can_arrive_in_time.size() + future_trainable;
 
-            if (potential_defenders < needed && threat.target != M.my_hq) {
-                doomed_bases.insert(threat.target);
-                continue; 
+            if (total_available < needed) {
+                int shortage = needed - total_available;
+
+                for (auto& m : active_missions) {
+                    if (shortage <= 0) break;
+                    if (m.target == M.opp_hq && simulate_base_race(S, M, P, m.squad_ids.size(), m.rally_point)) {
+                        continue;
+                    }
+
+                    for (auto it_id = m.squad_ids.begin(); it_id != m.squad_ids.end(); ) {
+                        if (shortage <= 0) break;
+
+                        WarriorId wid = *it_id;
+                        const Warrior* w_ptr = nullptr;
+                        for (const auto& w : my_warriors) {
+                            if (w.id == wid) { w_ptr = &w; break; }
+                        }
+
+                        if (w_ptr && get_hops(P, w_ptr->region, threat.target) <= threat.enemy_dist + 1) {
+                            it_id = m.squad_ids.erase(it_id);
+                            
+                            if (m.reserved_gold >= MOVE_COST) {
+                                m.reserved_gold -= MOVE_COST;
+                                virtual_gold += MOVE_COST;
+                                sim_gold += MOVE_COST; 
+                            }
+
+                            can_arrive_in_time.push_back(*w_ptr);
+                            shortage--;
+                            total_available++;
+                        } else {
+                            ++it_id;
+                        }
+                    }
+                }
             }
 
             int train_needed = std::max(0, needed - (int)can_arrive_in_time.size());
             sim_gold -= train_needed * TRAIN_COST; 
+
+            if (total_available < needed && threat.target != M.my_hq) {
+                doomed_bases.insert(threat.target);
+                continue; 
+            }
 
             std::sort(can_arrive_in_time.begin(), can_arrive_in_time.end(), [&](const Warrior& a, const Warrior& b){
                 return get_hops(P, a.region, threat.target) < get_hops(P, b.region, threat.target);
@@ -1355,7 +1408,7 @@ public:
             for (const auto& g : active_enemy_attacks) {
                 if (g.potential_targets.count(tgt)) {
                     for (auto id : g.ids) {
-                        if (!combined_e_ids.count(id)) { // Tránh trùng lặp lính
+                        if (!combined_e_ids.count(id)) { 
                             combined_e_ids.insert(id);
                             for (const auto& ew : enemy_warriors) {
                                 if (ew.id == id) { combined_e_hps.push_back(ew.hp); break; }
@@ -1367,7 +1420,6 @@ public:
                 }
             }
 
-            // MÔ PHỎNG: Nếu là HQ thì luôn tính. Nếu là Base thì chỉ theo dõi khi có > 2 địch ngắm tới
             if (combined_e_ids.size() > 0 && (tgt == M.my_hq || combined_e_ids.size() > 2)) {
                 int b_hp = 0, b_ad = 0;
                 for (const auto& b : S.buildings) {
@@ -1390,8 +1442,22 @@ public:
 
         for (auto const& [tgt, defenders] : my_defenders_by_target) {
             int req = current_req_per_base[tgt];
-            if ((int)defenders.size() > req) {
-                // Thừa lính! Sắp xếp quân phòng thủ theo khoảng cách xa nhất để ưu tiên giải phóng
+            
+            // [THÊM MỚI] Tính cả số lính lao động tại nhà này
+            int labor_existing = 0;
+            for (const auto& w : my_warriors) {
+                if (!emergency_targets.count(w.id)) {
+                    int job_tgt = -1;
+                    if (persistent_jobs.count(w.id)) job_tgt = persistent_jobs.at(w.id);
+                    else if (build_plans.count(w.id)) job_tgt = build_plans.at(w.id).first;
+                    else if (forward_build_plans.count(w.id)) job_tgt = forward_build_plans.at(w.id).first;
+                    
+                    if (job_tgt == tgt) labor_existing++;
+                }
+            }
+            int total_existing = (int)defenders.size() + labor_existing;
+
+            if (total_existing > req) {
                 std::vector<std::pair<int, WarriorId>> dist_id_pairs;
                 for (auto id : defenders) {
                     int d = 999;
@@ -1402,15 +1468,15 @@ public:
                 }
                 std::sort(dist_id_pairs.rbegin(), dist_id_pairs.rend());
                 
-                int excess = defenders.size() - req;
+                // Giải phóng tối đa là số lính chuyên thủ (không giải phóng nhầm lính labor)
+                int excess = std::min((int)defenders.size(), total_existing - req);
                 for (int i = 0; i < excess; ++i) {
                     WarriorId release_id = dist_id_pairs[i].second;
-                    emergency_targets.erase(release_id); // Lính này chính thức biến thành "Free Unit"
+                    emergency_targets.erase(release_id); 
                     predictive_defenders.erase(release_id);
                 }
             }
             
-            // Cập nhật lại danh sách đối tượng kẻ địch mà những lính vẫn đang thủ Base này cần theo dõi
             for (auto const& [my_id, my_tgt] : emergency_targets) {
                 if (my_tgt == tgt) {
                     predictive_defenders[my_id] = current_enemy_ids_per_base[tgt];
@@ -1418,7 +1484,6 @@ public:
             }
         }
         
-        // Dọn dẹp map cũ (quét những quân đã bị gỡ target)
         for (auto it = predictive_defenders.begin(); it != predictive_defenders.end(); ) {
             if (!emergency_targets.count(it->first)) it = predictive_defenders.erase(it);
             else ++it;
@@ -1479,7 +1544,19 @@ public:
             }
             std::vector<int> baseline_e_hps(baseline_invading_enemies, e_hp_val);
             int req_def = calculate_min_defenders(baseline_e_hps, b_hp, b_ad, m_hp_val);
-            current_req_defenders = std::max(current_req_defenders, req_def);
+            
+            // [THÊM MỚI] Tính số lượng lính lao động tại reg để trừ đi lượng lính thực sự bị thiếu
+            int labor_at_reg = 0;
+            for (const auto& w : my_warriors) {
+                int job_tgt = -1;
+                if (persistent_jobs.count(w.id)) job_tgt = persistent_jobs.at(w.id);
+                else if (build_plans.count(w.id)) job_tgt = build_plans.at(w.id).first;
+                else if (forward_build_plans.count(w.id)) job_tgt = forward_build_plans.at(w.id).first;
+                if (job_tgt == reg) labor_at_reg++;
+            }
+            
+            int actual_shortage = std::max(0, req_def - labor_at_reg);
+            current_req_defenders = std::max(current_req_defenders, actual_shortage);
         }
 
         int free_count = get_free_units(S).size();
@@ -1488,7 +1565,7 @@ public:
             emergency_train_queue += (current_req_defenders - free_count);
         }
 
-        // --- BƯỚC 4: BỔ SUNG QUÂN THỦ MỚI TỪ LƯỢNG QUÂN RẢNH ---
+        // --- BƯỚC 4: PHÂN BỔ PHÒNG THỦ VÀ TRIỆU HỒI KHẨN CẤP THEO THỨ TỰ ƯU TIÊN ---
         assign_predictive_defenders(S, M, P, current_req_per_base, current_enemy_ids_per_base, min_dist_per_base);
 
         for (int doomed_reg : doomed_bases) {
@@ -1499,6 +1576,7 @@ public:
                 }
             }
             
+            // Lính Labor ở base sập vẫn sẽ được gọi sơ tán ở bước này để bỏ nhà chạy
             if (enemy_close) {
                 virtual_job_slots[doomed_reg] = 0; 
                 for (auto it = persistent_jobs.begin(); it != persistent_jobs.end(); ) {
@@ -2016,8 +2094,16 @@ public:
             
             int base_budget = get_spendable_gold();
             if (base_budget >= BASE_LEVELS[1].cost) {
-                    forward_build_plans[cand.wid] = {cand.region, BASE_LEVELS[1].cost};
-                    current_builds++;
+                
+                // [THÊM MỚI] Kiểm tra an toàn trước nguy cơ All-in của địch
+                // Vì lính đã đứng sẵn ở Cứ điểm, khoảng cách di chuyển d_build = 0
+                // is_new_base = true, build_cost = 300
+                if (!is_safe_against_all_in(S, M, P, cand.region, BASE_LEVELS[1].cost, true, 0)) {
+                    continue; // Bỏ qua Cứ điểm này, giữ tiền lại để thủ nhà hoặc sinh lính
+                }
+
+                forward_build_plans[cand.wid] = {cand.region, BASE_LEVELS[1].cost};
+                current_builds++;
             }
         }
     }
