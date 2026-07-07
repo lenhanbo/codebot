@@ -258,7 +258,7 @@ public:
     // Snowball / Attack parameters
     const int TUNE_SNOWBALL_INCOME_GAP = 75;      
     const int TUNE_SNOWBALL_BUFFER = 5;           
-    const int TUNE_MISSION_TIMEOUT = 30;          // Cơ chế timeout cho nhiệm vụ đánh
+    const int TUNE_MISSION_TIMEOUT = 20;          // Cơ chế timeout cho nhiệm vụ đánh
     
     int max_bases_to_build = 0;
     int max_bases_to_upgrade = 0;
@@ -1853,27 +1853,27 @@ public:
         
         struct FwdCand { int region; int dist_opp; WarriorId wid; };
         std::vector<FwdCand> cands;
-
-        for (int sh : M.strongholds) {
-            int dist_opp = get_hops(P, sh, M.opp_hq);
-            int dist_my = get_hops(P, sh, M.my_hq);
-            if (dist_opp < dist_my) { 
-                bool has_b = false; 
-                for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
-                bool already_planned = false; 
-                for(auto const& [wid, plan] : build_plans) if (plan.first == sh) already_planned = true;
-                for(auto const& [wid, plan] : forward_build_plans) if (plan.first == sh) already_planned = true;
-                
-                if (!has_b && !already_planned) {
-                    for (const auto& w : free_units) {
-                        if (w.region == sh) { 
-                            cands.push_back({sh, dist_opp, w.id});
-                            break; 
+        if(!has_money_advantage)
+            for (int sh : M.strongholds) {
+                int dist_opp = get_hops(P, sh, M.opp_hq);
+                int dist_my = get_hops(P, sh, M.my_hq);
+                if (dist_opp < dist_my) { 
+                    bool has_b = false; 
+                    for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
+                    bool already_planned = false; 
+                    for(auto const& [wid, plan] : build_plans) if (plan.first == sh) already_planned = true;
+                    for(auto const& [wid, plan] : forward_build_plans) if (plan.first == sh) already_planned = true;
+                    
+                    if (!has_b && !already_planned) {
+                        for (const auto& w : free_units) {
+                            if (w.region == sh) { 
+                                cands.push_back({sh, dist_opp, w.id});
+                                break; 
+                            }
                         }
                     }
                 }
             }
-        }
 
         std::sort(cands.begin(), cands.end(), [](const FwdCand& a, const FwdCand& b){
             return a.dist_opp < b.dist_opp;
@@ -1994,7 +1994,7 @@ public:
             if (is_new) future_base_count++;
         }
 
-        if (!is_rushing_hq) {
+        if (!has_money_advantage) {
             for (int sh : M.strongholds) {
                 bool has_b = false; for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
                 bool already_planned = false; 
@@ -2029,7 +2029,7 @@ public:
             }
         }
 
-        if (!is_rushing_hq) {
+        if (has_money_advantage) {
             for (const auto& b : my_bases) {
                 bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == b.region) enemy_present = true;
                 bool already_planned = false; 
@@ -2301,11 +2301,15 @@ public:
                         {
                             int d_to_opp = get_hops(P, w.region, M.opp_hq);
                             int d_to_my = get_hops(P, w.region, M.my_hq);
-                            if (d_to_opp < d_to_my) {
+                            int d_to_center = get_hops(P, w.region, M.center_region);
+                            int p = get_hops(P, M.center_region, M.opp_hq);
+                            if (d_to_opp <= d_to_my) {
                                 final_target = w.region;
                             } else {
                                 if (has_center) {
-                                    final_target = M.center_region;
+                                    if(d_to_center >= p)
+                                        final_target = M.center_region;
+                                    else final_target = w.region;
                                 } else {
                                     final_target = M.my_hq;
                                 }
@@ -2364,7 +2368,7 @@ public:
         has_money_advantage = (my_net_income > opp_net_income + TUNE_GOLD_ADVANTAGE );
         
         bool cond1 = (opp_hq_b && hq_b && opp_hq_b->level > hq_b->level && my_net_income >= opp_net_income);
-        is_rushing_hq = (cond1 || has_money_advantage);
+        is_rushing_hq = (cond1 );
 
         bool hq_fast_tracked = false;
         if (is_rushing_hq && hq_b && hq_b->level < custom_hq_max_level) {
