@@ -241,11 +241,13 @@ static void emit_end() { std::cout << "END" << std::endl; }
 
 class BotAgent {
 public:
+    // tune parameter
+    const int TUNE_MAX_FORWARD_HOLDERS = 2;
     const int RESERVE_GOLD_ATTACK = 50; 
     const double TUNE_SCORE_REQ_WEIGHT = 10.0;    
     const double TUNE_SCORE_DIST_WEIGHT = 1.0;    
     const double TUNE_BASE_TARGET_BONUS = 200.0;   
-    const double TUNE_WEAK_BASE_BONUS = 150.0;    
+    const double TUNE_WEAK_BASE_BONUS = 500.0;    
     const double TUNE_HQ_TARGET_BONUS = 0.0;      
     const double TUNE_MAX_ARMY_RATIO = 0.9;       
     const int TUNE_GOLD_ADVANTAGE = 45;
@@ -2160,19 +2162,32 @@ public:
         
         std::vector<Warrior> free_units = get_free_units(S);
         int current_free_count = free_units.size();
+        int estimated_income = (persistent_jobs.size() * WORK_INCOME) - (my_warriors.size() * UPKEEP_PER_WARRIOR);
 
-        struct PlanCandidate {
-            int region; int cost; bool is_hq; bool is_new_base; 
-            int dist_to_my_hq; int priority; 
-            bool operator<(const PlanCandidate& o) const {
-                if (is_new_base != o.is_new_base) return is_new_base > o.is_new_base;
-                if (cost != o.cost) return cost < o.cost;
+        // ==========================================
+        // GOM NHÓM LÍNH RẢNH THEO KHU VỰC ĐỂ TỐI ƯU
+        // ==========================================
+        std::map<int, std::vector<Warrior>> free_by_region;
+        for (const auto& w : free_units) {
+            free_by_region[w.region].push_back(w);
+        }
+
+        // Tạo danh sách các Hub (Base & HQ của mình)
+        std::vector<int> my_hubs;
+        my_hubs.push_back(M.my_hq);
+        for (const auto& b : my_bases) my_hubs.push_back(b.region);
+
+        // ==========================================
+        // PHA 0: XỬ LÝ UPGRADE (HQ & Căn cứ hiện tại)
+        // ==========================================
+        struct UpgradeCandidate {
+            int region; int cost; bool is_hq; int priority;
+            bool operator<(const UpgradeCandidate& o) const {
                 if (priority != o.priority) return priority < o.priority;
-                return dist_to_my_hq < o.dist_to_my_hq;
+                return cost < o.cost;
             }
         };
-
-        std::vector<PlanCandidate> cands;
+        std::vector<UpgradeCandidate> up_cands;
 
         int lv1_count = 0, lv2_count = 0;
         for (const auto& b : my_bases) {
@@ -2183,57 +2198,18 @@ public:
         int max_to_lv3 = lv2_count / 2 + 1;
 
         int planned_to_lv2 = 0, planned_to_lv3 = 0;
-        for (const auto& plan : build_plans) {
+        auto count_planned = [&](int region) {
             for (const auto& b : my_bases) {
-                if (b.region == plan.second.first) {
+                if (b.region == region) {
                     if (b.level == 1) planned_to_lv2++;
                     if (b.level == 2) planned_to_lv3++;
                 }
             }
-        }
-        for (const auto& plan : forward_build_plans) {
-            for (const auto& b : my_bases) {
-                if (b.region == plan.second.first) {
-                    if (b.level == 1) planned_to_lv2++;
-                    if (b.level == 2) planned_to_lv3++;
-                }
-            }
-        }
+        };
+        for (const auto& plan : build_plans) count_planned(plan.second.first);
+        for (const auto& plan : forward_build_plans) count_planned(plan.second.first);
 
-        int future_base_count = my_bases.size();
-        for (const auto& plan : build_plans) {
-            bool is_new = true;
-            for (const auto& b : my_bases) { if (b.region == plan.second.first) { is_new = false; break; } }
-            if (is_new) future_base_count++;
-        }
-        for (const auto& plan : forward_build_plans) {
-            bool is_new = true;
-            for (const auto& b : my_bases) { if (b.region == plan.second.first) { is_new = false; break; } }
-            if (is_new) future_base_count++;
-        }
-
-        if (!has_money_advantage) {
-            for (int sh : M.strongholds) {
-                bool has_b = false; for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
-                bool already_planned = false; 
-                for(auto const& [wid, plan] : build_plans) if (plan.first == sh) already_planned = true;
-                for(auto const& [wid, plan] : forward_build_plans) if (plan.first == sh) already_planned = true;
-                
-                bool unit_standing_here = false;
-                for (const auto& w : free_units) { if (w.region == sh) { unit_standing_here = true; break; } }
-
-                if (!has_b && !already_planned) {
-                    bool is_my_half = get_hops(P, sh, M.my_hq) < get_hops(P, sh, M.opp_hq);
-                    if (sh == M.center_region || is_my_half || is_stronghold_safe(S, M, P, sh) || unit_standing_here) {
-                        PlanCandidate c; c.region = sh; c.cost = 300; c.is_hq = false; c.is_new_base = true; 
-                        c.dist_to_my_hq = get_hops(P, sh, M.my_hq); 
-                        if (future_base_count == 0) c.priority = 1; else c.priority = (sh == M.center_region) ? 1 : 2; 
-                        cands.push_back(c);
-                    }
-                }
-            }
-        }
-
+        // Upgrade HQ
         if (hq_b && hq_b->level < custom_hq_max_level && !hq_fast_tracked) {
             bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == hq_b->region) enemy_present = true;
             bool already_planned = false; 
@@ -2241,12 +2217,11 @@ public:
             for(auto const& [wid, plan] : forward_build_plans) if (plan.first == hq_b->region) already_planned = true;
             
             if (!already_planned && !enemy_present) {
-                PlanCandidate c; c.region = hq_b->region; c.cost = HQ_LEVELS[hq_b->level + 1].upgrade_cost;
-                c.is_hq = true; c.is_new_base = false; c.dist_to_my_hq = 0; c.priority = 1;
-                cands.push_back(c);
+                up_cands.push_back({hq_b->region, HQ_LEVELS[hq_b->level + 1].upgrade_cost, true, 1});
             }
         }
 
+        // Upgrade Base (Chỉ kích hoạt khi tiền dư dả)
         if (has_money_advantage) {
             for (const auto& b : my_bases) {
                 bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == b.region) enemy_present = true;
@@ -2256,61 +2231,200 @@ public:
                 
                 if (!already_planned && !enemy_present) {
                     if (b.level == 1 && planned_to_lv2 < max_to_lv2) {
-                        PlanCandidate c; c.region = b.region; c.cost = BASE_LEVELS[2].cost;
-                        c.is_hq = false; c.is_new_base = false; c.dist_to_my_hq = get_hops(P, b.region, M.my_hq); 
-                        c.priority = (b.region == M.center_region) ? 2 : 3; 
-                        cands.push_back(c); planned_to_lv2++; 
+                        up_cands.push_back({b.region, BASE_LEVELS[2].cost, false, (b.region == M.center_region) ? 2 : 3});
+                        planned_to_lv2++; 
                     } else if (b.level == 2 && planned_to_lv3 < max_to_lv3) {
-                        PlanCandidate c; c.region = b.region; c.cost = BASE_LEVELS[3].cost;
-                        c.is_hq = false; c.is_new_base = false; c.dist_to_my_hq = get_hops(P, b.region, M.my_hq); 
-                        c.priority = (b.region == M.center_region) ? 2 : 3; 
-                        cands.push_back(c); planned_to_lv3++;
+                        up_cands.push_back({b.region, BASE_LEVELS[3].cost, false, (b.region == M.center_region) ? 2 : 3});
+                        planned_to_lv3++;
                     }
                 }
             }
         }
         
-        std::sort(cands.begin(), cands.end());
-        int estimated_income = (persistent_jobs.size() * WORK_INCOME) - (my_warriors.size() * UPKEEP_PER_WARRIOR);
+        std::sort(up_cands.begin(), up_cands.end());
 
-        for (const auto& cand : cands) {
+        // Phân bổ ngân sách cho Upgrade
+        for (const auto& cand : up_cands) {
             int base_budget = get_spendable_gold();
-            
-            if (free_units.empty()) {
-                int D = cand.dist_to_my_hq;
+            if (current_free_count == 0) {
+                int D = get_hops(P, M.my_hq, cand.region);
                 int projected_gold = base_budget + (D * estimated_income);
-                int req_gold = cand.cost + TRAIN_COST + (MOVE_COST);
+                int req_gold = cand.cost + TRAIN_COST + MOVE_COST;
                 if (projected_gold >= req_gold) pending_train_requests++;
                 break; 
             }
             
-            int best_u = -1; int min_d = 999;
-            for (size_t i = 0; i < free_units.size(); i++) {
-                if (!is_safe_to_dispatch(S, free_units[i], cand.region, current_free_count, M, P)) continue;
-                
-                int d = get_hops(P, free_units[i].region, cand.region);
-                if (d < min_d) { min_d = d; best_u = i; }
+            // Tìm Hub (Base/HQ) gần mục tiêu nhất có lính rảnh
+            int best_hub = -1;
+            int min_d = 999;
+
+            for (int hub : my_hubs) {
+                if (free_by_region[hub].empty()) continue;
+                int d = get_hops(P, hub, cand.region);
+                if (d < min_d) { min_d = d; best_hub = hub; }
             }
 
-            if (best_u != -1) {
+            if (best_hub != -1) {
                 int D = min_d; 
-
-                if (!is_safe_against_all_in(S, M, P, cand.region, cand.cost, cand.is_new_base, D)) {
-                    continue; 
-                }
+                if (!is_safe_against_all_in(S, M, P, cand.region, cand.cost, false, D)) continue; 
 
                 int projected_real_gold = base_budget + (D * estimated_income);
                 int required_gold = cand.cost + (D * MOVE_COST);
                 
                 if (projected_real_gold >= required_gold) {
-                    build_plans[free_units[best_u].id] = {cand.region, cand.cost};
-                    current_free_count--;
-                    free_units.erase(free_units.begin() + best_u);
+                    // Chọn ngẫu nhiên 1 lính tại Hub
+                    int r_idx = std::rand() % free_by_region[best_hub].size();
+                    Warrior chosen_w = free_by_region[best_hub][r_idx];
 
-                    current_builds++; 
-                    if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) break; 
-                } else {
-                    break; 
+                    if (is_safe_to_dispatch(S, chosen_w, cand.region, current_free_count, M, P)) {
+                        build_plans[chosen_w.id] = {cand.region, cand.cost};
+                        current_free_count--;
+                        current_builds++; 
+                        
+                        free_by_region[best_hub].erase(free_by_region[best_hub].begin() + r_idx);
+                        if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) return; 
+                    }
+                }
+            }
+        }
+
+        // ==========================================
+        // LỌC DANH SÁCH STRONGHOLD TRỐNG
+        // ==========================================
+        std::vector<int> available_sh;
+        int forward_holders = 0; 
+
+        for (int sh : M.strongholds) {
+            bool has_b = false; for (const auto& bld : S.buildings) if (bld.region == sh) has_b = true;
+            bool already_planned = false; 
+            for(auto const& [wid, plan] : build_plans) if (plan.first == sh) already_planned = true;
+            for(auto const& [wid, plan] : forward_build_plans) if (plan.first == sh) already_planned = true;
+            
+            bool is_my_half = get_hops(P, sh, M.my_hq) <= get_hops(P, sh, M.opp_hq);
+
+            if (!has_b && !already_planned) {
+                available_sh.push_back(sh);
+            } else if (already_planned && !is_my_half) {
+                forward_holders++; 
+            }
+        }
+
+        // ==========================================
+        // PHA 1: MỞ RỘNG (CHỈ DUYỆT CÁC HUB CÓ LÍNH)
+        // ==========================================
+        
+        // 1. Chống lỗi lính ma: Xử lý trước lính ĐÃ ĐỨNG SẴN trên Stronghold trống
+        for (auto it = free_by_region.begin(); it != free_by_region.end(); ++it) {
+            int reg = it->first;
+            auto sh_it = std::find(available_sh.begin(), available_sh.end(), reg);
+            if (sh_it != available_sh.end()) {
+                while (!it->second.empty() && current_builds < TUNE_MAX_CONCURRENT_BUILDS) {
+                    int base_budget = get_spendable_gold();
+                    
+                    if (base_budget >= 300 && is_safe_against_all_in(S, M, P, reg, 300, true, 0)) {
+                        int r_idx = std::rand() % it->second.size();
+                        Warrior chosen_w = it->second[r_idx];
+
+                        build_plans[chosen_w.id] = {reg, 300};
+                        current_free_count--;
+                        current_builds++;
+                        
+                        bool is_my_half = get_hops(P, reg, M.my_hq) <= get_hops(P, reg, M.opp_hq);
+                        if (!is_my_half) forward_holders++;
+
+                        it->second.erase(it->second.begin() + r_idx);
+                        available_sh.erase(sh_it);
+                        break; 
+                    } else {
+                        break; 
+                    }
+                }
+            }
+        }
+
+        // 2. Chuyển qua từng Base/HQ có lính rảnh 
+        if (!has_money_advantage) {
+            for (int hub : my_hubs) {
+                while (!free_by_region[hub].empty() && current_builds < TUNE_MAX_CONCURRENT_BUILDS) {
+                    int base_budget = get_spendable_gold();
+                    int best_sh = -1;
+                    int min_dist_to_hub = 999;
+
+                    for (int sh : available_sh) {
+                        bool is_my_half = get_hops(P, sh, M.my_hq) <= get_hops(P, sh, M.opp_hq);
+
+                        if (!is_my_half && forward_holders >= TUNE_MAX_FORWARD_HOLDERS) continue;
+
+                        if (sh == M.center_region || is_my_half || is_stronghold_safe(S, M, P, sh)) {
+                            int d = get_hops(P, hub, sh);
+                            if (d < min_dist_to_hub) {
+                                if (is_safe_against_all_in(S, M, P, sh, 300, true, d)) {
+                                    min_dist_to_hub = d;
+                                    best_sh = sh;
+                                }
+                            }
+                        }
+                    }
+
+                    bool assigned = false;
+                    if (best_sh != -1) {
+                        int D = min_dist_to_hub;
+                        int projected_real_gold = base_budget + (D * estimated_income);
+                        int required_gold = 300 + (D * MOVE_COST);
+
+                        if (projected_real_gold >= required_gold) {
+                            // Bốc ngẫu nhiên 1 lính tại hub
+                            int r_idx = std::rand() % free_by_region[hub].size();
+                            Warrior chosen_w = free_by_region[hub][r_idx];
+
+                            if (is_safe_to_dispatch(S, chosen_w, best_sh, current_free_count, M, P)) {
+                                build_plans[chosen_w.id] = {best_sh, 300};
+                                current_free_count--;
+                                current_builds++;
+                                
+                                bool is_my_half = get_hops(P, best_sh, M.my_hq) <= get_hops(P, best_sh, M.opp_hq);
+                                if (!is_my_half) forward_holders++;
+
+                                free_by_region[hub].erase(free_by_region[hub].begin() + r_idx);
+                                available_sh.erase(std::remove(available_sh.begin(), available_sh.end(), best_sh), available_sh.end());
+                                assigned = true;
+                            }
+                        }
+                    }
+                    
+                    // Nếu không tìm được bãi hoặc thiếu tiền -> dừng tại hub này
+                    if (!assigned) break; 
+                }
+            }
+        }
+
+        // ==========================================
+        // PHA 2: SINH LÍNH (TÌM BÃI GẦN HQ NHẤT)
+        // ==========================================
+        if (current_builds < TUNE_MAX_CONCURRENT_BUILDS && !has_money_advantage) {
+            int base_budget = get_spendable_gold();
+
+            std::vector<int> hq_cands = available_sh;
+            std::sort(hq_cands.begin(), hq_cands.end(), [&](int a, int b) {
+                return get_hops(P, M.my_hq, a) < get_hops(P, M.my_hq, b);
+            });
+
+            for (int sh : hq_cands) {
+                if (current_builds >= TUNE_MAX_CONCURRENT_BUILDS) break;
+
+                bool is_my_half = get_hops(P, sh, M.my_hq) <= get_hops(P, sh, M.opp_hq);
+                if (!is_my_half && forward_holders >= TUNE_MAX_FORWARD_HOLDERS) continue;
+
+                if (sh == M.center_region || is_my_half || is_stronghold_safe(S, M, P, sh)) {
+                    int D = get_hops(P, M.my_hq, sh);
+                    int projected_gold = base_budget + (D * estimated_income);
+                    int req_gold = 300 + TRAIN_COST + (D * MOVE_COST);
+
+                    if (projected_gold >= req_gold) {
+                        pending_train_requests++;
+                        current_builds++; 
+                        if (!is_my_half) forward_holders++;
+                    }
                 }
             }
         }
