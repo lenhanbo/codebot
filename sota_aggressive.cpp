@@ -1216,7 +1216,10 @@ public:
         }
     }
 
-    void assign_predictive_defenders(const GameState &S, const GameMap &M, const Paths &P) {
+    void assign_predictive_defenders(const GameState &S, const GameMap &M, const Paths &P,
+                                     const std::map<int, int>& req_per_base,
+                                     const std::map<int, std::set<WarriorId>>& e_ids_per_base,
+                                     const std::map<int, int>& min_dist_per_base) {
         doomed_bases.clear(); 
         
         struct Threat {
@@ -1229,45 +1232,20 @@ public:
         };
         std::vector<Threat> active_threats;
 
-        for (const auto& g : active_enemy_attacks) {
-            int best_target = -1;
-            int min_dist_enemy = 999;
-            
-            for (int tgt : g.potential_targets) {
-                int d_e = get_hops(P, g.current_region, tgt);
-                if (d_e < min_dist_enemy) {
-                    min_dist_enemy = d_e;
-                    best_target = tgt;
-                }
-            }
-
-            if (best_target != -1) {
-                int e_hp_val = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
-                int m_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
-                int b_hp = 0, b_ad = 0, b_level = 1;
+        // Chuyển đổi dữ liệu đã tính toán thành danh sách đe dọa
+        for (auto const& [tgt, req] : req_per_base) {
+            if (req > 0) {
+                int b_level = 1;
                 for (const auto& b : S.buildings) {
-                    if (b.region == best_target) {
-                        b_hp = b.hp;
-                        b_ad = get_b_ad(S, best_target);
-                        b_level = b.level;
-                        break;
-                    }
+                    if (b.region == tgt) { b_level = b.level; break; }
                 }
-                std::vector<int> exact_e_hps;
-                for (auto id : g.ids) {
-                    for (const auto& ew : enemy_warriors) {
-                        if (ew.id == id) { exact_e_hps.push_back(ew.hp); break; }
-                    }
-                }
-                int req_def = calculate_min_defenders(exact_e_hps, b_hp, b_ad, m_hp_val);
-                if (req_def > 0) {
-                    int priority = (best_target == M.my_hq) ? 1000 : (b_level * 10);
-                    int max_cap = (best_target == M.my_hq) ? 9999 : (b_level * 5 + 5); 
-                    active_threats.push_back({best_target, min_dist_enemy, g.ids, req_def, priority, max_cap});
-                }
+                int priority = (tgt == M.my_hq) ? 1000 : (b_level * 10);
+                int max_cap = (tgt == M.my_hq) ? 9999 : (b_level * 5 + 5); 
+                active_threats.push_back({tgt, min_dist_per_base.at(tgt), e_ids_per_base.at(tgt), req, priority, max_cap});
             }
         }
 
+        // Ưu tiên: Base bị đe dọa gần nhất -> Độ quan trọng của Base
         std::sort(active_threats.begin(), active_threats.end(), [&](const Threat& a, const Threat& b) {
             if(a.enemy_dist == b.enemy_dist) return a.priority > b.priority;
             return a.enemy_dist < b.enemy_dist;
@@ -1281,14 +1259,12 @@ public:
 
         for (const auto& threat : active_threats) {
             int existing = 0;
-            for (auto const& [my_id, e_ids] : predictive_defenders) {
-                if (emergency_targets.count(my_id) && emergency_targets.at(my_id) == threat.target) {
-                    existing++;
-                }
+            for (auto const& [my_id, my_tgt] : emergency_targets) {
+                if (my_tgt == threat.target) existing++;
             }
 
             int needed = threat.req_def - existing;
-            if (needed <= 0) continue;
+            if (needed <= 0) continue; // Nếu đã đủ (hoặc dư) quân thủ thì bỏ qua
 
             if (threat.req_def > threat.max_cap && threat.target != M.my_hq) {
                 doomed_bases.insert(threat.target);
@@ -1359,27 +1335,96 @@ public:
 
         update_enemy_attack_groups(S, M, P);
 
-        for (auto it = predictive_defenders.begin(); it != predictive_defenders.end(); ) {
-            WarriorId my_id = it->first;
-            int my_target = emergency_targets.count(my_id) ? emergency_targets[my_id] : -1;
-            bool still_valid = false;
-            
-            for (WarriorId e_id : it->second) {
-                for (const auto& g : active_enemy_attacks) {
-                    if (g.ids.count(e_id) && g.potential_targets.count(my_target)) {
-                        still_valid = true; break;
+        // --- BƯỚC 1: LẤY BASE LÀM TRUNG TÂM & TÍNH TỔNG UY HIẾP (Aggregated Threat) ---
+        std::map<int, int> current_req_per_base;
+        std::map<int, std::set<WarriorId>> current_enemy_ids_per_base;
+        std::map<int, int> min_dist_per_base;
+
+        int e_hp_val = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
+        int m_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
+
+        std::vector<int> bases_to_check;
+        bases_to_check.push_back(M.my_hq);
+        for (const auto& b : my_bases) bases_to_check.push_back(b.region);
+
+        for (int tgt : bases_to_check) {
+            std::vector<int> combined_e_hps;
+            std::set<WarriorId> combined_e_ids;
+            int min_d = 999;
+
+            for (const auto& g : active_enemy_attacks) {
+                if (g.potential_targets.count(tgt)) {
+                    for (auto id : g.ids) {
+                        if (!combined_e_ids.count(id)) { // Tránh trùng lặp lính
+                            combined_e_ids.insert(id);
+                            for (const auto& ew : enemy_warriors) {
+                                if (ew.id == id) { combined_e_hps.push_back(ew.hp); break; }
+                            }
+                        }
                     }
+                    int d = get_hops(P, g.current_region, tgt);
+                    if (d < min_d) min_d = d;
                 }
-                if (still_valid) break;
             }
-            if (!still_valid) {
-                emergency_targets.erase(my_id);
-                it = predictive_defenders.erase(it);
+
+            // MÔ PHỎNG: Nếu là HQ thì luôn tính. Nếu là Base thì chỉ theo dõi khi có > 2 địch ngắm tới
+            if (combined_e_ids.size() > 0 && (tgt == M.my_hq || combined_e_ids.size() > 2)) {
+                int b_hp = 0, b_ad = 0;
+                for (const auto& b : S.buildings) {
+                    if (b.region == tgt) { b_hp = b.hp; b_ad = get_b_ad(S, tgt); break; }
+                }
+                int req_def = calculate_min_defenders(combined_e_hps, b_hp, b_ad, m_hp_val);
+                current_req_per_base[tgt] = req_def;
+                current_enemy_ids_per_base[tgt] = combined_e_ids;
+                min_dist_per_base[tgt] = min_d;
             } else {
-                ++it;
+                current_req_per_base[tgt] = 0;
             }
         }
 
+        // --- BƯỚC 2: GIẢI PHÓNG QUÂN THỪA KHI ĐỊCH RẼ HƯỚNG/TÁCH NHÓM (Early Release) ---
+        std::map<int, std::vector<WarriorId>> my_defenders_by_target;
+        for (auto const& [my_id, tgt] : emergency_targets) {
+            my_defenders_by_target[tgt].push_back(my_id);
+        }
+
+        for (auto const& [tgt, defenders] : my_defenders_by_target) {
+            int req = current_req_per_base[tgt];
+            if ((int)defenders.size() > req) {
+                // Thừa lính! Sắp xếp quân phòng thủ theo khoảng cách xa nhất để ưu tiên giải phóng
+                std::vector<std::pair<int, WarriorId>> dist_id_pairs;
+                for (auto id : defenders) {
+                    int d = 999;
+                    for (const auto& w : my_warriors) {
+                        if (w.id == id) { d = get_hops(P, w.region, tgt); break; }
+                    }
+                    dist_id_pairs.push_back({d, id});
+                }
+                std::sort(dist_id_pairs.rbegin(), dist_id_pairs.rend());
+                
+                int excess = defenders.size() - req;
+                for (int i = 0; i < excess; ++i) {
+                    WarriorId release_id = dist_id_pairs[i].second;
+                    emergency_targets.erase(release_id); // Lính này chính thức biến thành "Free Unit"
+                    predictive_defenders.erase(release_id);
+                }
+            }
+            
+            // Cập nhật lại danh sách đối tượng kẻ địch mà những lính vẫn đang thủ Base này cần theo dõi
+            for (auto const& [my_id, my_tgt] : emergency_targets) {
+                if (my_tgt == tgt) {
+                    predictive_defenders[my_id] = current_enemy_ids_per_base[tgt];
+                }
+            }
+        }
+        
+        // Dọn dẹp map cũ (quét những quân đã bị gỡ target)
+        for (auto it = predictive_defenders.begin(); it != predictive_defenders.end(); ) {
+            if (!emergency_targets.count(it->first)) it = predictive_defenders.erase(it);
+            else ++it;
+        }
+
+        // --- BƯỚC 3: XỬ LÝ DỰ BÁO LƯỢNG QUÂN ALL-IN VÀ KÊU GỌI BƠM LÍNH KHẨN CẤP ---
         int total_enemy = enemy_warriors.size();
 
         int enemy_labor = 0;
@@ -1406,33 +1451,23 @@ public:
             if (ew.region == M.opp_hq) opp_hq_troop_count++;
         }
         int old_baseline = std::max(0, opp_hq_troop_count - opp_hq_labor_cap);
-
         int baseline_invading_enemies = std::max(estimated_all_in, old_baseline);
-
-        // --- BẮT ĐẦU PHẦN SỬA ĐỔI: Chống All-in cho HQ và Base ---
         
-        // 1. Tính toán Net Income của 2 bên
         int my_net_inc = get_my_net_income(S, M, my_warriors.size());
         int opp_net_inc = get_enemy_net_income(S, M, enemy_warriors.size());
         
-        // 2. Chỉ phòng thủ toàn bộ base khi Net Income của mình hơn đối phương 1 khoảng (TUNE_GOLD_ADVANTAGE)
         bool defend_all_bases = (my_net_inc >= opp_net_inc + 30);
 
         std::vector<int> bases_to_defend;
-        bases_to_defend.push_back(M.my_hq); // Mặc định luôn luôn phải phòng thủ HQ
+        bases_to_defend.push_back(M.my_hq); 
         
         if (defend_all_bases) {
             for (const auto& b : my_bases) {
                 bases_to_defend.push_back(b.region);
             }
         }
-
-        int e_hp = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
-        int m_hp = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
         
         current_req_defenders = 0;
-        
-        // 3. Quét qua các căn cứ trong danh sách bảo vệ và tìm số lượng lính thủ lớn nhất cần thiết
         for (int reg : bases_to_defend) {
             int b_hp = 0, b_ad = 0;
             for (const auto& b : S.buildings) {
@@ -1442,11 +1477,8 @@ public:
                     break;
                 }
             }
-            
-            // Tính số lính tối thiểu để thủ base này trước khối lượng lính All-in
-            std::vector<int> baseline_e_hps(baseline_invading_enemies, e_hp);
-            int req_def = calculate_min_defenders(baseline_e_hps, b_hp, b_ad, m_hp);
-            // Lấy mức yêu cầu thủ cao nhất (vì lính địch có thể đập base yếu nhất)
+            std::vector<int> baseline_e_hps(baseline_invading_enemies, e_hp_val);
+            int req_def = calculate_min_defenders(baseline_e_hps, b_hp, b_ad, m_hp_val);
             current_req_defenders = std::max(current_req_defenders, req_def);
         }
 
@@ -1456,7 +1488,8 @@ public:
             emergency_train_queue += (current_req_defenders - free_count);
         }
 
-        assign_predictive_defenders(S, M, P);
+        // --- BƯỚC 4: BỔ SUNG QUÂN THỦ MỚI TỪ LƯỢNG QUÂN RẢNH ---
+        assign_predictive_defenders(S, M, P, current_req_per_base, current_enemy_ids_per_base, min_dist_per_base);
 
         for (int doomed_reg : doomed_bases) {
             bool enemy_close = false;
