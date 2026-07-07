@@ -250,10 +250,14 @@ public:
     const double TUNE_MAX_ARMY_RATIO = 0.9;       
     const int TUNE_GOLD_ADVANTAGE = 45;
     const int TUNE_MIN_LABOR_TO_FIGHT = 3; 
-    const int TUNE_MIN_NET_INCOME_TO_ATTACK = 50; 
+    const int TUNE_MIN_NET_INCOME_TO_ATTACK = 0; 
     const int TUNE_MAX_CONCURRENT_BUILDS = 3;
     const int TUNE_MAX_CONCURRENT_ATTACKS = 4;
     const double TUNE_ENEMY_IN_MY_HALF_BONUS = 100000.0;
+
+    // --- Các thông số mới cho Flag thích nghi phòng thủ ---
+    const int TUNE_STRONG_DEFENSE_TIMEOUT = 15; // Số lượt bật cờ khi phát hiện địch thủ mạnh
+    int strong_defense_turns_left = 0;          // Cờ: > 0 là Địch thủ mạnh, = 0 là Địch thủ yếu
     
     // Snowball / Attack parameters
     const int TUNE_SNOWBALL_INCOME_GAP = 75;      
@@ -882,30 +886,54 @@ public:
             std::map<int, int> sim_reinforcements = reinforcements_by_day;
 
             for(int day = 0; day < 50 + dist_from_us; ++day) {
-                if (sim_reinforcements.count(day)) {
-                    int r = sim_reinforcements[day];
-                    e_units += r;
-                    e_hp_pool += r * opp_hp_per_unit;
+                // [MỚI] Tách riêng logic kéo viện binh và logic đẻ lính thủ
+                bool enemy_pulls_reinforcements = true;
+                bool enemy_trains_defenders = true;
+                
+                if (strong_defense_turns_left == 0) { // Khi địch phòng thủ yếu
+                    if (!is_hq) {
+                        // Đánh Base: Bỏ qua hoàn toàn viện binh và lính sinh thêm từ HQ
+                        enemy_pulls_reinforcements = false; 
+                        enemy_trains_defenders = false;
+                    } else {
+                        // Đánh HQ: Viện binh từ xa chỉ kéo về khi mình sát 1 ô
+                        enemy_pulls_reinforcements = (day >= dist_from_us - 1); 
+                        // NHƯNG luôn luôn mô phỏng đẻ lính mới tại HQ dựa vào tiền
+                        enemy_trains_defenders = (day >= dist_from_us - 1); 
+                    }
                 }
 
+                // 1. Logic Viện binh từ xa đến
+                if (sim_reinforcements.count(day)) {
+                    int r = sim_reinforcements[day];
+                    if (enemy_pulls_reinforcements) { 
+                        e_units += r;
+                        e_hp_pool += r * opp_hp_per_unit;
+                    }
+                }
+
+                // 2. Logic Sinh lính thủ tại HQ
                 if (opp_hq_b && cur_base_hp > 0) {
                     int spawns = std::min(opp_train_cap, sim_gold / TRAIN_COST);
-                    sim_gold -= spawns * TRAIN_COST;
-                    total_sim_e_units += spawns;
-                    
-                    if (is_hq) {
-                        if (day >= 1) { 
-                            e_units += spawns;
-                            e_hp_pool += spawns * opp_hp_per_unit;
-                        }
-                    } else {
-                        if (day >= 1) { 
-                            int d_hq = get_hops(P, M.opp_hq, final_target);
-                            sim_reinforcements[day + d_hq] += spawns;
+                    if (enemy_trains_defenders) { 
+                        sim_gold -= spawns * TRAIN_COST;
+                        total_sim_e_units += spawns;
+                        
+                        if (is_hq) {
+                            if (day >= 1) { 
+                                e_units += spawns;
+                                e_hp_pool += spawns * opp_hp_per_unit;
+                            }
+                        } else {
+                            if (day >= 1) { 
+                                int d_hq = get_hops(P, M.opp_hq, final_target);
+                                sim_reinforcements[day + d_hq] += spawns;
+                            }
                         }
                     }
                 }
                 
+                // 3. Logic Giao tranh (Giữ nguyên)
                 if (day >= dist_from_us) {
                     int dmg_to_us = (cur_base_hp > 0 ? b_ad : 0) + e_units;
                     int dmg_to_them = my_units;
@@ -1491,6 +1519,9 @@ public:
         // ============================================
         // 1. CẬP NHẬT CÁC NHIỆM VỤ HIỆN CÓ
         // ============================================
+        // ============================================
+        // 1. CẬP NHẬT CÁC NHIỆM VỤ HIỆN CÓ
+        // ============================================
         for (auto it = active_missions.begin(); it != active_missions.end(); ) {
             bool target_alive = (it->target == M.opp_hq);
             if (!target_alive) {
@@ -1499,6 +1530,12 @@ public:
             
             // Nếu hủy do mất target hoặc đã tung quân nhưng chết sạch lính -> Hoàn trả tiền
             if (!target_alive || (it->is_launched && it->squad_ids.empty())) { 
+                
+                // [MỚI] Đợt tấn công bị dập tắt (mục tiêu còn sống mà lính chết hết)
+                if (target_alive && it->is_launched && it->squad_ids.empty()) {
+                    strong_defense_turns_left = TUNE_STRONG_DEFENSE_TIMEOUT; // Bật Flag Địch thủ mạnh
+                }
+
                 virtual_gold += it->reserved_gold;
                 it = active_missions.erase(it); 
                 continue; 
@@ -2392,6 +2429,7 @@ public:
 
     Actions decide(const GameState &S, const GameMap &M, const Paths &P, int turn) {
         Actions a;
+        if (strong_defense_turns_left > 0) strong_defense_turns_left--;
         update_state_and_clean_dead(S, M, P); 
         
         int my_net_income = get_my_net_income(S, M, my_warriors.size());
