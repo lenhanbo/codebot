@@ -255,7 +255,7 @@ public:
     const int TUNE_MIN_LABOR_TO_FIGHT = 3; 
     const int TUNE_INCOME_THRESHOLD_TURN = 100;   // Mốc lượt chơi để thay đổi ngưỡng income
     const int TUNE_MIN_INCOME_EARLY = 30;        // Ngưỡng income đầu game
-    const int TUNE_MIN_INCOME_LATE =  100;        // Ngưỡng income cần thiết sau mốc TUNE_INCOME_THRESHOLD_TURN
+    const int TUNE_MIN_INCOME_LATE =  50;        // Ngưỡng income cần thiết sau mốc TUNE_INCOME_THRESHOLD_TURN
     const int TUNE_MAX_CONCURRENT_BUILDS = 3;
     const int TUNE_MAX_CONCURRENT_ATTACKS = 4;
     const double TUNE_ENEMY_IN_MY_HALF_BONUS = 100000.0;
@@ -327,6 +327,150 @@ public:
     const Building* hq_b = nullptr; 
     const Building* opp_hq_b = nullptr;
     int enemy_bases_count = 0; 
+
+    // THÊM BIẾN MỚI
+    bool is_absolute_all_in = false;
+
+    // [Ý 2] HÀM GIẢ LẬP ĐUA LEVEL HQ ĐẾN CUỐI GAME
+    bool check_hq_race_to_end(const GameState& S, const GameMap& M, int turn) {
+        int sim_my_gold = virtual_gold;
+        int sim_opp_gold = opp_gold;
+        int my_net = get_my_net_income(S, M, my_warriors.size());
+        int opp_net = get_enemy_net_income(S, M, enemy_warriors.size());
+        
+        int my_lvl = hq_b ? hq_b->level : 1;
+        int opp_lvl = opp_hq_b ? opp_hq_b->level : 1;
+        
+        for (int t = turn; t < 200; ++t) {
+            sim_my_gold += my_net;
+            sim_opp_gold += opp_net;
+            sim_my_gold = std::max(0, sim_my_gold);
+            sim_opp_gold = std::max(0, sim_opp_gold);
+            
+            if (my_lvl < custom_hq_max_level && sim_my_gold >= HQ_LEVELS[my_lvl + 1].upgrade_cost) {
+                sim_my_gold -= HQ_LEVELS[my_lvl + 1].upgrade_cost;
+                my_lvl++;
+            }
+            if (opp_lvl < HQ_MAX_LEVEL && sim_opp_gold >= HQ_LEVELS[opp_lvl + 1].upgrade_cost) {
+                sim_opp_gold -= HQ_LEVELS[opp_lvl + 1].upgrade_cost;
+                opp_lvl++;
+            }
+        }
+        // Trả về true nếu cuối game mình bằng hoặc hơn cấp độ địch (và ít nhất phải có tài chính duy trì)
+        return (my_lvl >= opp_lvl && my_lvl > 1); 
+    }
+
+    // [Ý 4] HÀM GIẢ LẬP ABSOLUTE ALL-IN
+    bool check_absolute_all_in(const GameState& S, const GameMap& M, const Paths& P, int turn) {
+        if (turn >= 200) return false;
+        
+        int opp_hq_hp = opp_hq_b ? opp_hq_b->hp : 10;
+        int opp_hq_ad = get_b_ad(S, M.opp_hq);
+        int my_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
+        int opp_hp_val = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
+        int opp_train_cap = opp_hq_b ? opp_hq_b->train_cap() : 1;
+        int my_train_cap = hq_b ? hq_b->train_cap() : 1;
+        
+        std::vector<int> init_e_hp_counts(10, 0);
+        for (const auto& ew : enemy_warriors) {
+            if (ew.region == M.opp_hq && ew.hp > 0 && ew.hp <= 9) {
+                init_e_hp_counts[ew.hp]++;
+            }
+        }
+        
+        // Thời gian lính hiện tại tới HQ địch (KHÔNG GỌI THỢ MỎ)
+        std::map<int, int> my_arrivals;
+        for (const auto& w : my_warriors) {
+            if (!persistent_jobs.count(w.id)) {
+                int d = get_hops(P, w.region, M.opp_hq);
+                if (d != 999) my_arrivals[d]++;
+            }
+        }
+        
+        int my_gross = get_my_gross_income(S, M);
+        int opp_gross = get_enemy_gross_income(S, M);
+        int my_hq_to_opp_hq = get_hops(P, M.my_hq, M.opp_hq);
+        
+        auto calc_T_win = [&]() -> int {
+            std::vector<int> cur_e = init_e_hp_counts; 
+            std::vector<int> cur_m(10, 0);             
+            int cur_base_hp = opp_hq_hp;
+            int sim_mg = virtual_gold;
+            int sim_og = opp_gold;
+            int sim_my_total_units = my_warriors.size();
+            int sim_opp_total_units = enemy_warriors.size();
+            
+            for(int day = 0; day < 200 - turn; ++day) {
+                // Ta train lính
+                int my_spawn = std::min(my_train_cap, sim_mg / TRAIN_COST);
+                sim_mg -= my_spawn * TRAIN_COST;
+                sim_my_total_units += my_spawn;
+                if (my_hq_to_opp_hq != 999 && my_spawn > 0) my_arrivals[day + my_hq_to_opp_hq] += my_spawn;
+                sim_mg = std::max(0, sim_mg + (my_gross - sim_my_total_units * UPKEEP_PER_WARRIOR));
+                
+                // Địch train lính
+                int opp_spawn = std::min(opp_train_cap, sim_og / TRAIN_COST);
+                sim_og -= opp_spawn * TRAIN_COST;
+                sim_opp_total_units += opp_spawn;
+                sim_og = std::max(0, sim_og + (opp_gross - sim_opp_total_units * UPKEEP_PER_WARRIOR));
+                cur_e[opp_hp_val] += opp_spawn;
+                
+                // Lính ta tới nơi
+                if (my_arrivals.count(day)) {
+                    cur_m[my_hp_val] += my_arrivals[day];
+                }
+                
+                int m_count = 0;
+                for(int h = 1; h <= 9; ++h) m_count += cur_m[h];
+                
+                if (cur_base_hp <= 0) return day; // Nổ HQ địch
+                if (day > 50 && m_count == 0) return 999; // Hết lính đẩy
+                
+                simulate_combat_step(cur_m, cur_e, cur_base_hp, opp_hq_ad);
+            }
+            return cur_base_hp <= 0 ? (200 - turn) : 999;
+        };
+        
+        int T_us = calc_T_win();
+        if (T_us == 999) return false; 
+        
+        // TÍNH THỜI GIAN ĐỊCH PHÁ HQ TA (WORST CASE)
+        std::vector<int> total_e_hps(10, 0);
+        int min_d_them = 999;
+        for (const auto& ew : enemy_warriors) {
+            if (ew.region != M.opp_hq) { 
+                if (ew.hp > 0 && ew.hp <= 9) total_e_hps[ew.hp]++;
+                int d = get_hops(P, ew.region, M.my_hq);
+                if (d < min_d_them) min_d_them = d;
+            }
+        }
+        int total_them_count = 0;
+        for(int h=1; h<=9; ++h) total_them_count += total_e_hps[h];
+        if (total_them_count == 0 || min_d_them == 999) return true; 
+        
+        int my_hq_hp_sim = hq_b ? hq_b->hp : 10;
+        int my_hq_ad = get_b_ad(S, M.my_hq);
+        
+        auto calc_T_lose = [&]() -> int {
+            std::vector<int> cur_e = total_e_hps; 
+            std::vector<int> cur_m(10, 0); 
+            int cur_base_hp = my_hq_hp_sim;
+            
+            for(int day = 0; day < 200 - turn; ++day) {
+                if (day >= min_d_them) {
+                    int e_count = 0;
+                    for(int h = 1; h <= 9; ++h) e_count += cur_e[h];
+                    if (cur_base_hp <= 0) return day;
+                    if (e_count == 0) return 999;
+                    simulate_combat_step(cur_e, cur_m, cur_base_hp, my_hq_ad);
+                }
+            }
+            return cur_base_hp <= 0 ? (200 - turn) : 999;
+        };
+        
+        int T_them = calc_T_lose();
+        return T_us < T_them; // Phải kết liễu địch trước khi nhà mình cháy
+    }
 
     int get_dynamic_min_income_to_attack(int turn) const {
         if (turn < TUNE_INCOME_THRESHOLD_TURN) {
@@ -1480,6 +1624,7 @@ public:
         update_enemy_attack_groups(S, M, P);
 
         // --- BƯỚC 1: LẤY BASE LÀM TRUNG TÂM & TÍNH TỔNG UY HIẾP (Aggregated Threat) ---
+        // --- BƯỚC 1: LẤY BASE LÀM TRUNG TÂM & TÍNH TỔNG UY HIẾP (Aggregated Threat) ---
         std::map<int, int> current_req_per_base;
         std::map<int, std::set<WarriorId>> current_enemy_ids_per_base;
         std::map<int, int> min_dist_per_base;
@@ -1491,13 +1636,40 @@ public:
         bases_to_check.push_back(M.my_hq);
         for (const auto& b : my_bases) bases_to_check.push_back(b.region);
 
+        // [Ý 1] Lọc ra mục tiêu gần nhất cho mỗi nhóm tấn công của địch
+        std::map<int, std::vector<EnemyAttackGroup>> closest_groups_per_base;
+        
+        for (const auto& g : active_enemy_attacks) {
+            int best_tgt = -1;
+            int min_dist_to_tgt = 999;
+            int best_priority = -1; // Ưu tiên HQ > Base level cao > Base level thấp
+            
+            for (int tgt : bases_to_check) {
+                if (g.potential_targets.count(tgt)) {
+                    int d = get_hops(P, g.current_region, tgt);
+                    int b_level = 1;
+                    for (const auto& b : S.buildings) if (b.region == tgt) { b_level = b.level; break; }
+                    int priority = (tgt == M.my_hq) ? 1000 : (b_level * 10);
+                    
+                    if (d < min_dist_to_tgt || (d == min_dist_to_tgt && priority > best_priority)) {
+                        best_tgt = tgt;
+                        min_dist_to_tgt = d;
+                        best_priority = priority;
+                    }
+                }
+            }
+            if (best_tgt != -1) {
+                closest_groups_per_base[best_tgt].push_back(g);
+            }
+        }
+
         for (int tgt : bases_to_check) {
             std::vector<int> combined_e_hps;
             std::set<WarriorId> combined_e_ids;
             int min_d = 999;
 
-            for (const auto& g : active_enemy_attacks) {
-                if (g.potential_targets.count(tgt)) {
+            if (closest_groups_per_base.count(tgt)) {
+                for (const auto& g : closest_groups_per_base[tgt]) {
                     for (auto id : g.ids) {
                         if (!combined_e_ids.count(id)) { 
                             combined_e_ids.insert(id);
@@ -1780,7 +1952,7 @@ public:
             }
             int ready_count = ready_wids.size();
 
-            // Cân đối Quỹ đen theo lượng lính đã tới Rally[cite: 1]
+            // Cân đối Quỹ đen theo lượng lính đã tới Rally
             int target_reserve = ready_count * MOVE_COST;
             if (it->reserved_gold < target_reserve) {
                 int diff = target_reserve - it->reserved_gold;
@@ -1807,7 +1979,7 @@ public:
             if (t_first_arrival == 999) t_first_arrival = 0;
 
             // =========================================================
-            // [GIỮ LẠI] TÌM KIẾM MỤC TIÊU TỐT HƠN (CHUYỂN MỤC TIÊU)[cite: 1]
+            // [GIỮ LẠI] TÌM KIẾM MỤC TIÊU TỐT HƠN (CHUYỂN MỤC TIÊU)
             // =========================================================
             struct TargetCand { int tgt; int req; double score; };
             TargetCand best_cand = {-1, 99999, -9999999.0};
@@ -1827,10 +1999,11 @@ public:
                     if (dist == 999) continue;
                     if (tgt != it->target && locked_targets.count(tgt)) continue; 
                     
-                    // Tính req cho mục tiêu mới dựa trên reaction window
                     int deficit_c = std::max(0, it->required_attackers - ready_count);
                     int t_gather_c = (deficit_c > 0) ? (deficit_c / train_cap) : 0;
-                    int er_window = std::max(0, t_gather_c - t_first_arrival) + dist;
+                    int er_window =0;
+                    if(strong_defense_turns_left >0) er_window = std::max(0, t_gather_c - t_first_arrival - 3) + dist - 1;
+                    else er_window =  1;
                     int req = calculate_req_attackers(tgt, er_window, S, M, P);
 
                     if (ready_count >= req && req > 0) {
@@ -1844,7 +2017,6 @@ public:
                         }
                         score -= dist * 50.0;
                         score -= (ready_count - req) * 10.0;
-                        // if (tgt == it->target) score += 200.0;
                         
                         if (score > best_cand.score) {
                             best_cand = {tgt, req, score};
@@ -1865,6 +2037,9 @@ public:
                 int deficit = std::max(0, it->required_attackers - (int)it->squad_ids.size());
                 int t_gather = (deficit > 0) ? (deficit / train_cap) : 0;
                 int enemy_reaction_window = std::max(0, t_gather - t_first_arrival) + dist_rp_tgt;
+                
+                if(strong_defense_turns_left >0) enemy_reaction_window = std::max(0, t_gather - t_first_arrival - 3) + dist_rp_tgt - 1;
+                else enemy_reaction_window = 1;
 
                 it->required_attackers = calculate_req_attackers(it->target, enemy_reaction_window, S, M, P);
             }
@@ -1877,11 +2052,6 @@ public:
                 if (it->target == M.opp_hq) {
                     can_launch = simulate_base_race(S, M, P, it->required_attackers, it->rally_point);
                 } else {
-                    // Giả lập xóa quân đi đánh khỏi bản đồ để Test All-in
-                    std::vector<Warrior> backup_warriors = my_warriors;
-                    my_warriors.erase(std::remove_if(my_warriors.begin(), my_warriors.end(),
-                        [&](const Warrior& w){ return it->squad_ids.count(w.id); }), my_warriors.end());
-                    
                     can_launch = true;
                     std::vector<int> bases_to_check = {M.my_hq};
                     for (auto& b : my_bases) bases_to_check.push_back(b.region);
@@ -1890,7 +2060,6 @@ public:
                             can_launch = false; break;
                         }
                     }
-                    my_warriors = backup_warriors; // Phục hồi
                 }
             }
 
@@ -1929,10 +2098,13 @@ public:
                         current_free_count--; 
                     }
                     if (current_squad_size < it->required_attackers) {
-                        pending_train_requests += (it->required_attackers - current_squad_size);
+                        // KHI ĐANG RUSH HQ -> KHÔNG PHÁT SINH NHU CẦU MUA LÍNH ĐÁNH LẺ
+                        if (!is_rushing_hq) {
+                            pending_train_requests += (it->required_attackers - current_squad_size);
+                        }
                     }
                 } 
-                // Cắt giảm nếu thừa lính[cite: 1]
+                // Cắt giảm nếu thừa lính
                 else if (current_squad_size > it->required_attackers) {
                     std::vector<Warrior> squad_units;
                     for(auto wid : it->squad_ids) {
@@ -1957,7 +2129,7 @@ public:
         // ============================================
         int my_net_income = get_my_net_income(S, M, my_warriors.size());
         int opp_net_income = get_enemy_net_income(S, M, enemy_warriors.size());
-        if (!can_attack_struct || !can_attack_econ || opp_net_income - my_net_income > 30) return; 
+        if (!can_attack_struct || !can_attack_econ ) return; 
 
         std::vector<int> potential_targets;
         if (!locked_targets.count(M.opp_hq)) potential_targets.push_back(M.opp_hq);
@@ -1983,15 +2155,17 @@ public:
             }
             if (t_first_arrival == 999) t_first_arrival = 0;
             
-            // Re-calc Loop để ước lượng Enemy Reaction chính xác nhất
-            int enemy_reaction_window = dist_rp_tgt;
+            int enemy_reaction_window = 1;
+            if(strong_defense_turns_left >0) enemy_reaction_window = dist_rp_tgt;
             int current_req = calculate_req_attackers(tgt, enemy_reaction_window, S, M, P);
             
             int train_cap = hq_b ? hq_b->train_cap() : 1;
             int deficit = std::max(0, current_req - (int)atk_units.size());
             int t_gather = (deficit > 0) ? (deficit / train_cap) : 0;
             
-            enemy_reaction_window = std::max(0, t_gather - t_first_arrival) + dist_rp_tgt;
+            enemy_reaction_window = 1;
+            if(strong_defense_turns_left >0) enemy_reaction_window = std::max(0, t_gather - t_first_arrival - 3) + dist_rp_tgt - 1;
+                else enemy_reaction_window = 1;
             current_req = calculate_req_attackers(tgt, enemy_reaction_window, S, M, P); 
             
             double score = (current_req * TUNE_SCORE_REQ_WEIGHT) + (dist_rp_tgt * TUNE_SCORE_DIST_WEIGHT);
@@ -2002,14 +2176,6 @@ public:
                 score -= TUNE_BASE_TARGET_BONUS;
                 if (current_req <= 10) score -= TUNE_WEAK_BASE_BONUS; 
             }
-
-            // bool has_gathering = false;
-            // for (const auto& g : active_enemy_attacks) {
-            //     if (g.type == ThreatType::GATHERING && g.current_region == tgt) {
-            //         has_gathering = true; break;
-            //     }
-            // }
-            // if (has_gathering) score -= 50000.0;
             
             int dist_to_my_hq = get_hops(P, tgt, M.my_hq);
             int dist_to_opp_hq = get_hops(P, tgt, M.opp_hq);
@@ -2063,21 +2229,15 @@ public:
                 }
             }
 
-            // Xin tiền quỹ đen cho lính ĐÃ ĐẾN Rally
             int transfer = std::min(virtual_gold, ready_at_rally * MOVE_COST);
             m.reserved_gold += transfer;
             virtual_gold -= transfer;
 
-            // Kiểm tra Launch cho Mission mới khởi tạo
             bool can_launch = false;
             if (ready_at_rally >= m.required_attackers && m.required_attackers > 0 && m.reserved_gold >= m.required_attackers * MOVE_COST) {
                 if (opt.tgt == M.opp_hq) {
                     can_launch = simulate_base_race(S, M, P, m.required_attackers, m.rally_point);
                 } else {
-                    std::vector<Warrior> backup_warriors = my_warriors;
-                    my_warriors.erase(std::remove_if(my_warriors.begin(), my_warriors.end(),
-                        [&](const Warrior& w){ return m.squad_ids.count(w.id); }), my_warriors.end());
-                    
                     can_launch = true;
                     std::vector<int> bases_to_check = {M.my_hq};
                     for (auto& b : my_bases) bases_to_check.push_back(b.region);
@@ -2086,7 +2246,6 @@ public:
                             can_launch = false; break;
                         }
                     }
-                    my_warriors = backup_warriors; // Phục hồi
                 }
             }
 
@@ -2094,7 +2253,10 @@ public:
                 m.is_launched = true;
                 locked_targets.insert(opt.tgt); 
             } else {
-                pending_train_requests += train_shortage;
+                // KHI ĐANG RUSH HQ -> KHÔNG PHÁT SINH YÊU CẦU MUA LÍNH
+                if (!is_rushing_hq) {
+                    pending_train_requests += train_shortage;
+                }
                 gathering_targets.insert(opt.tgt); 
             }
 
@@ -2286,7 +2448,7 @@ public:
         }
 
         // Upgrade Base
-        if (has_money_advantage) {
+        if (!has_money_advantage) {
             for (const auto& b : my_bases) {
                 bool enemy_present = false; for (const auto& ew : enemy_warriors) if (ew.region == b.region) enemy_present = true;
                 bool already_planned = false; 
@@ -2693,6 +2855,15 @@ public:
         int cap = hq_b ? hq_b->train_cap() : 1;
         int spendable_gold = get_spendable_gold();
         
+        // NẾU VÀO TRẠNG THÁI ABSOLUTE ALL-IN -> XẢ MAX TIỀN MUA LÍNH LIÊN TỤC
+        if (is_absolute_all_in) {
+            if (virtual_gold >= TRAIN_COST) {
+                int act = std::min(cap, virtual_gold / TRAIN_COST);
+                if (act > 0) { a.train_n = act; virtual_gold -= act * TRAIN_COST; has_trained = true; }
+            }
+            return;
+        }
+
         if (!has_trained && emergency_train_queue > 0 && virtual_gold >= TRAIN_COST) {
             int act = std::min({emergency_train_queue, cap, virtual_gold / TRAIN_COST});
             if(act > 0) { a.train_n = act; virtual_gold -= act * TRAIN_COST; has_trained = true; }
@@ -2702,6 +2873,7 @@ public:
             if(act > 0) { a.train_n = act; virtual_gold -= act * TRAIN_COST; has_trained = true; }
         }
     }
+
 
     void execute_movement(const GameState &S, const GameMap &M, const Paths &P, Actions &a, int turn) {
         std::vector<Warrior*> w_ptrs;
@@ -2735,7 +2907,11 @@ public:
             bool is_sync_attack = false;
             int target_arrival_turn = -1;
             
-            if (predictive_defenders.count(w.id) || emergency_targets.count(w.id)) {
+            // ĐIỀU LỆNH TỐI CAO: NẾU ALL-IN, TOÀN BỘ LÍNH CHƯA LÀM THỢ (TRỐNG JOB) SẼ LÀM CẢM TỬ QUÂN
+            if (is_absolute_all_in && !persistent_jobs.count(w.id)) {
+                final_target = M.opp_hq;
+            }
+            else if (predictive_defenders.count(w.id) || emergency_targets.count(w.id)) {
                 final_target = emergency_targets[w.id];
                 is_emergency = true;
             } else { 
@@ -2808,8 +2984,8 @@ public:
                     for (const auto& b : S.buildings) if (b.region == final_target && b.side == M.my_side) final_is_my_base = true;
                     if (!final_is_my_base) cost = MOVE_COST;
 
-                    // [ĐÃ TRẢ VỀ NGUYÊN BẢN] Đi chiếm Base hay đi farm đều dùng quỹ chung (virtual_gold)
-                    if((is_emergency && virtual_gold >= cost) || (!is_emergency && virtual_gold >= cost + total_upkeep)) { 
+                    // Absolute All-In có quỹ đặc quyền (Tiêu sạch tiền hiện có để đẩy quân nhanh nhất)
+                    if((is_emergency && virtual_gold >= cost) || (!is_emergency && virtual_gold >= cost + total_upkeep) || (is_absolute_all_in && virtual_gold >= cost)) { 
                         a.moves.push_back({w.id, final_target}); 
                         virtual_gold -= cost; 
                     }
@@ -2825,10 +3001,13 @@ public:
         
         int my_net_income = get_my_net_income(S, M, my_warriors.size());
         int opp_net_income = get_enemy_net_income(S, M, enemy_warriors.size());
-        has_money_advantage = (my_net_income > opp_net_income + TUNE_GOLD_ADVANTAGE );
+        has_money_advantage = (my_net_income >= opp_net_income + TUNE_GOLD_ADVANTAGE);
         
-        bool cond1 = (opp_hq_b && hq_b && opp_hq_b->level > hq_b->level && my_net_income >= opp_net_income);
-        is_rushing_hq = (cond1 );
+        // [Ý 2] Tinh chỉnh điều kiện is_rushing_hq
+        is_rushing_hq = false;
+        if (opp_hq_b && hq_b && has_money_advantage) {
+            is_rushing_hq = check_hq_race_to_end(S, M, turn);
+        }
 
         bool hq_fast_tracked = false;
         if (is_rushing_hq && hq_b && hq_b->level < custom_hq_max_level) {
@@ -2846,21 +3025,25 @@ public:
             }
         }
 
-        plan_forward_expansion(S, M, P);
-        process_forward_build_plans(S, M, P, a);
-        // if(my_net_income >= opp_net_income - 15){
+        // [Ý 4] Kiểm tra chốt hạ
+        is_absolute_all_in = check_absolute_all_in(S, M, P, turn);
+
+        if (is_absolute_all_in) {
+            // Hủy toàn bộ mission, thủ, mở rộng để tiết kiệm tính toán và tiền bạc. Thợ mỏ tự giữ vị trí sinh tiền.
+            active_missions.clear();
+            predictive_defenders.clear();
+            emergency_targets.clear();
+            build_plans.clear();
+            forward_build_plans.clear();
+        } else {
+            plan_forward_expansion(S, M, P);
+            process_forward_build_plans(S, M, P, a);
             plan_attacks(S, M, P, turn);
             detect_and_handle_emergencies(S, M, P); 
             plan_expansion(S, M, P, hq_fast_tracked);
             process_build_plans(S, M, P, a);
             assign_jobs_to_free_units(S, M, P);
-        // } else {
-        //     detect_and_handle_emergencies(S, M, P); 
-        //     plan_expansion(S, M, P, hq_fast_tracked);
-        //     plan_attacks(S, M, P, turn);
-        //     process_build_plans(S, M, P, a);
-        //     assign_jobs_to_free_units(S, M, P);
-        // }
+        }
         
         execute_training(S, M, P, a);
         execute_movement(S, M, P, a, turn);
