@@ -258,7 +258,7 @@ public:
     // Snowball / Attack parameters
     const int TUNE_SNOWBALL_INCOME_GAP = 75;      
     const int TUNE_SNOWBALL_BUFFER = 5;           
-    const int TUNE_MISSION_TIMEOUT = 20;          // Cơ chế timeout cho nhiệm vụ đánh
+    const int TUNE_MISSION_TIMEOUT = 30;          // Cơ chế timeout cho nhiệm vụ đánh
     
     int max_bases_to_build = 0;
     int max_bases_to_upgrade = 0;
@@ -1354,11 +1354,46 @@ public:
 
         int baseline_invading_enemies = std::max(estimated_all_in, old_baseline);
 
+        // --- BẮT ĐẦU PHẦN SỬA ĐỔI: Chống All-in cho HQ và Base ---
+        
+        // 1. Tính toán Net Income của 2 bên
+        int my_net_inc = get_my_net_income(S, M, my_warriors.size());
+        int opp_net_inc = get_enemy_net_income(S, M, enemy_warriors.size());
+        
+        // 2. Chỉ phòng thủ toàn bộ base khi Net Income của mình hơn đối phương 1 khoảng (TUNE_GOLD_ADVANTAGE)
+        bool defend_all_bases = (my_net_inc >= opp_net_inc + 30);
+
+        std::vector<int> bases_to_defend;
+        bases_to_defend.push_back(M.my_hq); // Mặc định luôn luôn phải phòng thủ HQ
+        
+        if (defend_all_bases) {
+            for (const auto& b : my_bases) {
+                bases_to_defend.push_back(b.region);
+            }
+        }
+
         int e_hp = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
         int m_hp = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
-        int hq_ad = get_b_ad(S, M.my_hq);
-        int hq_hp = hq_b ? hq_b->hp : 10;
-        current_req_defenders = calculate_min_defenders(baseline_invading_enemies, e_hp, hq_hp, hq_ad, m_hp);
+        
+        current_req_defenders = 0;
+        
+        // 3. Quét qua các căn cứ trong danh sách bảo vệ và tìm số lượng lính thủ lớn nhất cần thiết
+        for (int reg : bases_to_defend) {
+            int b_hp = 0, b_ad = 0;
+            for (const auto& b : S.buildings) {
+                if (b.region == reg) {
+                    b_hp = b.hp;
+                    b_ad = get_b_ad(S, reg);
+                    break;
+                }
+            }
+            
+            // Tính số lính tối thiểu để thủ base này trước khối lượng lính All-in
+            int req_def = calculate_min_defenders(baseline_invading_enemies, e_hp, b_hp, b_ad, m_hp);
+            
+            // Lấy mức yêu cầu thủ cao nhất (vì lính địch có thể đập base yếu nhất)
+            current_req_defenders = std::max(current_req_defenders, req_def);
+        }
 
         int free_count = get_free_units(S).size();
 
@@ -2301,15 +2336,11 @@ public:
                         {
                             int d_to_opp = get_hops(P, w.region, M.opp_hq);
                             int d_to_my = get_hops(P, w.region, M.my_hq);
-                            int d_to_center = get_hops(P, w.region, M.center_region);
-                            int p = get_hops(P, M.center_region, M.opp_hq);
-                            if (d_to_opp <= d_to_my) {
+                            if (d_to_opp < d_to_my) {
                                 final_target = w.region;
                             } else {
                                 if (has_center) {
-                                    if(d_to_center >= p)
-                                        final_target = M.center_region;
-                                    else final_target = w.region;
+                                    final_target = M.center_region;
                                 } else {
                                     final_target = M.my_hq;
                                 }
