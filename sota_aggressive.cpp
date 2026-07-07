@@ -323,6 +323,53 @@ public:
     const Building* opp_hq_b = nullptr;
     int enemy_bases_count = 0; 
 
+
+    void simulate_combat_step(
+        std::vector<int>& atk_counts, // Tần suất HP quân công
+        std::vector<int>& def_counts, // Tần suất HP quân thủ
+        int& def_base_hp,
+        int def_base_ad
+    ) const {
+        int a_alive = 0, d_alive = 0;
+        for (int h = 1; h <= 9; ++h) {
+            a_alive += atk_counts[h];
+            d_alive += def_counts[h];
+        }
+
+        if (a_alive == 0) return; // Nếu quân công chết hết, không có sát thương nào được gây ra
+
+        int dmg_to_def = a_alive;
+        // Lấy sát thương của tháp pháo cộng thêm vào nếu Base còn sống
+        int dmg_to_atk = d_alive + (def_base_hp > 0 ? def_base_ad : 0);
+
+        // 1. Quân công đánh quân thủ & Base
+        for (int i = 0; i < dmg_to_def; ++i) {
+            bool hit = false;
+            // Tìm quân thủ có HP thấp nhất để đánh
+            for (int h = 1; h <= 9; ++h) {
+                if (def_counts[h] > 0) {
+                    def_counts[h]--;
+                    def_counts[h - 1]++; // Unit rớt xuống mức HP thấp hơn (về 0 tức là chết ở cuối ngày)
+                    hit = true; break;
+                }
+            }
+            // Nếu không còn lính thủ, đánh vào Base
+            if (!hit && def_base_hp > 0) def_base_hp--;
+        }
+
+        // 2. Quân thủ & Base đánh quân công
+        for (int i = 0; i < dmg_to_atk; ++i) {
+            // Tìm quân công có HP thấp nhất để đánh
+            for (int h = 1; h <= 9; ++h) {
+                if (atk_counts[h] > 0) {
+                    atk_counts[h]--;
+                    atk_counts[h - 1]++;
+                    break;
+                }
+            }
+        }
+    }
+
     int get_my_gross_income(const GameState& S, const GameMap& M) const {
         int income = 0;
         for (const auto& b : S.buildings) {
@@ -457,52 +504,24 @@ public:
         if (enemy_hps.empty()) return 0;
         
         std::vector<int> init_e_hp_counts(10, 0);
-        for(int hp : enemy_hps) if(hp > 0 && hp < 10) init_e_hp_counts[hp]++;
+        for(int hp : enemy_hps) if(hp > 0 && hp <= 9) init_e_hp_counts[hp]++;
             
         for (int D = 0; D <= (int)enemy_hps.size() + 5; ++D) {
-            std::vector<int> cur_e = init_e_hp_counts;
-            std::vector<int> cur_m(10, 0);
+            std::vector<int> cur_e = init_e_hp_counts; // Lính địch (Quân công)
+            std::vector<int> cur_m(10, 0);             // Lính mình (Quân thủ)
             if (D > 0) cur_m[my_hp_val] = D;
             int cur_b_hp = base_hp;
 
             for(int day = 0; day < 200; ++day) {
-                int e_count = 0, m_count = 0;
-                for(int h=1; h<=9; ++h) { e_count += cur_e[h]; m_count += cur_m[h]; }
+                int e_count = 0;
+                for(int h = 1; h <= 9; ++h) e_count += cur_e[h];
                 
                 if (e_count == 0 || cur_b_hp <= 0) break;
 
-                int dmg_to_e = m_count + (cur_b_hp > 0 ? base_ad : 0);
-                int dmg_to_m = e_count;
-                
-                // M bắn E
-                for(int i = 0; i < dmg_to_e; ++i) {
-                    bool hit = false;
-                    for(int h = 1; h <= 9; ++h) {
-                        if(cur_e[h] > 0) {
-                            cur_e[h]--;
-                            if(h - 1 > 0) cur_e[h - 1]++;
-                            hit = true; break;
-                        }
-                    }
-                    if(!hit) break; 
-                }
-                
-                // E bắn M và Base
-                for(int i = 0; i < dmg_to_m; ++i) {
-                    bool hit = false;
-                    for(int h = 1; h <= 9; ++h) {
-                        if(cur_m[h] > 0) {
-                            cur_m[h]--;
-                            if(h - 1 > 0) cur_m[h - 1]++;
-                            hit = true; break;
-                        }
-                    }
-                    if(!hit) {
-                        if (cur_b_hp > 0) cur_b_hp--;
-                        else break;
-                    }
-                }
+                // Kẻ địch là phe Công, Mình là phe Thủ
+                simulate_combat_step(cur_e, cur_m, cur_b_hp, base_ad);
             }
+            // Nếu căn cứ sống sót, trả về số lính D
             if (cur_b_hp > 0) return D;
         }
         return enemy_hps.size();
@@ -514,67 +533,50 @@ public:
         int d_us = get_hops(P, rp, M.opp_hq);
         if (d_us == 999) return false;
         
+        // Chỉ số thực tế của HQ địch
         int opp_hq_hp = opp_hq_b ? opp_hq_b->hp : 10;
         int opp_hq_ad = get_b_ad(S, M.opp_hq);
-        int opp_hp_val = opp_hq_b ? HQ_LEVELS[opp_hq_b->level].warrior_hp : 4;
         
         std::vector<int> init_e_hp_counts(10, 0);
         for (const auto& ew : enemy_warriors) {
-            if (ew.region == M.opp_hq && ew.hp > 0 && ew.hp < 10) {
+            if (ew.region == M.opp_hq && ew.hp > 0 && ew.hp <= 9) {
                 init_e_hp_counts[ew.hp]++;
             }
         }
         
         int my_hp_val = hq_b ? HQ_LEVELS[hq_b->level].warrior_hp : 4;
         
+        // TÍNH SỐ NGÀY TA PHÁ XONG HQ ĐỊCH
         auto calc_T_win = [&]() -> int {
-            std::vector<int> cur_e = init_e_hp_counts;
-            std::vector<int> cur_m(10, 0);
+            std::vector<int> cur_e = init_e_hp_counts; // Địch (Quân thủ)
+            std::vector<int> cur_m(10, 0);             // Mình (Quân công)
             if (A > 0) cur_m[my_hp_val] = A;
             int cur_base_hp = opp_hq_hp;
             
             for(int day = 0; day < 200; ++day) {
                 if (day >= d_us) {
-                    int e_count = 0, m_count = 0;
-                    for(int h=1; h<=9; ++h) { e_count += cur_e[h]; m_count += cur_m[h]; }
-                    
-                    int dmg_to_m = e_count + (cur_base_hp > 0 ? opp_hq_ad : 0);
-                    int dmg_to_e = m_count;
-                    
-                    for(int i=0; i<dmg_to_e; ++i) {
-                        bool hit = false;
-                        for(int h=1; h<=9; ++h) {
-                            if(cur_e[h] > 0) { cur_e[h]--; if(h-1 > 0) cur_e[h-1]++; hit = true; break; }
-                        }
-                        if(!hit) { if(cur_base_hp > 0) cur_base_hp--; else break; }
-                    }
-                    
-                    for(int i=0; i<dmg_to_m; ++i) {
-                        bool hit = false;
-                        for(int h=1; h<=9; ++h) {
-                            if(cur_m[h] > 0) { cur_m[h]--; if(h-1 > 0) cur_m[h-1]++; hit = true; break; }
-                        }
-                        if(!hit) break; 
-                    }
-                    
-                    m_count = 0;
-                    for(int h=1; h<=9; ++h) m_count += cur_m[h];
+                    int m_count = 0;
+                    for(int h = 1; h <= 9; ++h) m_count += cur_m[h];
                     
                     if (cur_base_hp <= 0) return day;
-                    if (m_count == 0) return 999;
+                    if (m_count == 0) return 999; // Lính mình chết sạch trước khi phá xong
+                    
+                    // Ta là phe Công, Địch là phe Thủ
+                    simulate_combat_step(cur_m, cur_e, cur_base_hp, opp_hq_ad);
                 }
             }
-            return 999;
+            return cur_base_hp <= 0 ? 200 : 999;
         };
         
         int T_us = calc_T_win();
         if (T_us == 999) return false; 
         
+        // TÍNH SỐ NGÀY ĐỊCH PHÁ XONG HQ TA
         std::vector<int> total_e_hps(10, 0);
         int min_d_them = 999;
         for (const auto& ew : enemy_warriors) {
             if (ew.region != M.opp_hq) { 
-                if (ew.hp > 0 && ew.hp < 10) total_e_hps[ew.hp]++;
+                if (ew.hp > 0 && ew.hp <= 9) total_e_hps[ew.hp]++;
                 int d = get_hops(P, ew.region, M.my_hq);
                 if (d < min_d_them) min_d_them = d;
             }
@@ -583,42 +585,30 @@ public:
         int total_them_count = 0;
         for(int h=1; h<=9; ++h) total_them_count += total_e_hps[h];
         
-        if (total_them_count == 0) return true; 
-        if (min_d_them == 999) return true;
+        if (total_them_count == 0 || min_d_them == 999) return true;
         
+        // Chỉ số thực tế của HQ mình
         int my_hq_hp_sim = hq_b ? hq_b->hp : 10;
         int my_hq_ad = get_b_ad(S, M.my_hq);
         
         auto calc_T_lose = [&]() -> int {
-            std::vector<int> cur_e = total_e_hps;
+            std::vector<int> cur_e = total_e_hps; // Địch (Quân công)
+            std::vector<int> cur_m(10, 0);        // Mình (Quân thủ - giả định ko có lính thủ để tính worst-case)
             int cur_base_hp = my_hq_hp_sim;
             
             for(int day = 0; day < 200; ++day) {
                 if (day >= min_d_them) {
                     int e_count = 0;
-                    for(int h=1; h<=9; ++h) e_count += cur_e[h];
-                    
-                    int dmg_to_e = (cur_base_hp > 0 ? my_hq_ad : 0);
-                    int dmg_to_m = e_count;
-                    
-                    for(int i=0; i<dmg_to_e; ++i) {
-                        bool hit = false;
-                        for(int h=1; h<=9; ++h) {
-                            if(cur_e[h] > 0) { cur_e[h]--; if(h-1 > 0) cur_e[h-1]++; hit = true; break; }
-                        }
-                        if(!hit) break;
-                    }
-                    
-                    cur_base_hp -= dmg_to_m;
-                    
-                    e_count = 0;
-                    for(int h=1; h<=9; ++h) e_count += cur_e[h];
+                    for(int h = 1; h <= 9; ++h) e_count += cur_e[h];
                     
                     if (cur_base_hp <= 0) return day;
                     if (e_count == 0) return 999;
+                    
+                    // Địch là phe Công, Mình là phe Thủ
+                    simulate_combat_step(cur_e, cur_m, cur_base_hp, my_hq_ad);
                 }
             }
-            return 999;
+            return cur_base_hp <= 0 ? 200 : 999;
         };
         
         int T_them = calc_T_lose();
@@ -846,6 +836,7 @@ public:
         int my_net_income = get_my_net_income(S, M, my_warriors.size());
         int opp_net_income = get_enemy_net_income(S, M, enemy_warriors.size());
 
+        // Cơ chế Snowball: Nếu áp đảo kinh tế và không đánh HQ
         if (!is_hq && my_net_income - opp_net_income >= TUNE_SNOWBALL_INCOME_GAP) {
             int b_hp = 0;
             for (const auto& b : S.buildings) {
@@ -900,7 +891,7 @@ public:
             if (busy_enemies.count(ew.id)) continue;
 
             if (ew.region == final_target) {
-                if(ew.hp > 0 && ew.hp < 10) init_def_hps[ew.hp]++;
+                if(ew.hp > 0 && ew.hp <= 9) init_def_hps[ew.hp]++;
             } else {
                 local_enemy_counts[ew.region]++;
             }
@@ -975,32 +966,11 @@ public:
                     int e_count = 0, m_count = 0;
                     for(int h=1; h<=9; ++h) { e_count += cur_e[h]; m_count += cur_m[h]; }
                     
-                    int dmg_to_m = e_count + (cur_base_hp > 0 ? b_ad : 0);
-                    int dmg_to_e = m_count;
-                    
-                    // M đánh E và Base
-                    for(int i=0; i<dmg_to_e; ++i) {
-                        bool hit = false;
-                        for(int h=1; h<=9; ++h) {
-                            if(cur_e[h] > 0) { cur_e[h]--; if(h-1 > 0) cur_e[h-1]++; hit = true; break; }
-                        }
-                        if(!hit) { if(cur_base_hp > 0) cur_base_hp--; else break; }
-                    }
-                    
-                    // E đánh M
-                    for(int i=0; i<dmg_to_m; ++i) {
-                        bool hit = false;
-                        for(int h=1; h<=9; ++h) {
-                            if(cur_m[h] > 0) { cur_m[h]--; if(h-1 > 0) cur_m[h-1]++; hit = true; break; }
-                        }
-                        if(!hit) break; 
-                    }
-                    
-                    m_count = 0;
-                    for(int h=1; h<=9; ++h) m_count += cur_m[h];
-                    
                     if (cur_base_hp <= 0) return true; 
                     if (m_count == 0) return false; 
+                    
+                    // GỌI HÀM MÔ PHỎNG CHUẨN: Lính mình là Quân Công (cur_m), Lính địch là Quân Thủ (cur_e)
+                    simulate_combat_step(cur_m, cur_e, cur_base_hp, b_ad);
                 }
                 
                 int sim_net_inc = opp_gross_inc - total_sim_e_units * UPKEEP_PER_WARRIOR;
